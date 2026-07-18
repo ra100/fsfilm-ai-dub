@@ -88,6 +88,15 @@ else, inspect `pipeline.json`:
 - `grouping.max_gap_seconds`: 6 seconds by default so subtitle gaps inside one
   scripted turn do not create artificial separate takes. Lower it only when a
   long visual/action break should be rendered as a new turn.
+- `grouping.merge_consecutive_same_role`: enabled by default. Adjacent script
+  rows spoken by the same actor are rendered as one turn when they fit the gap
+  and maximum-duration limits. The pipeline never merges across another
+  character, because splitting a synthetic performance across interleaved
+  dialogue would harm picture timing and acting continuity.
+- `render.minimum_emotion_seconds`: source turns shorter than 1.2 seconds use
+  the reviewed actor reference as the emotion anchor. Voice identity is thus
+  stable even for a one-word reply; use `roles.<ROLE>.emotion_audio` when a
+  specific short-line emotion needs a dedicated prompt.
 - `translation.accent`: metadata for the translator/reviewer. Source-conditioned
   cloning preserves some source accent; it does not guarantee General American
   pronunciation. Do a small audition before committing to a language/accent.
@@ -208,7 +217,7 @@ Render one complete, source-conditioned A-style turn at a time. It uses the
 actor reference for identity and the Czech/source turn for emotion and melody.
 
 ```bash
-$INDEXPY ai_dub/reusable_pipeline.py render --config "$PIPE" --variants 2
+$INDEXPY ai_dub/reusable_pipeline.py render --config "$PIPE" --variants 3
 $PY ai_dub/reusable_pipeline.py select --config "$PIPE"
 ```
 
@@ -219,10 +228,28 @@ $INDEXPY ai_dub/reusable_pipeline.py render --config "$PIPE" --groups 7,31 --var
 $PY ai_dub/reusable_pipeline.py select --config "$PIPE" --groups 7,31
 ```
 
+Every raw take is retained at `work/renders/<turn>_<ROLE>/candidate_01.wav`,
+`candidate_02.wav`, and `candidate_03.wav`; selection never deletes or replaces
+them. `work/candidate_audition.csv` lists every candidate, its transcript,
+duration and automatic score.
+
 Read `work/selection.csv` and listen to every row with a review flag. The
 selector checks target-language ASR recall, ending presence and fit to the next
 source turn. It chooses only from the newly rendered A-style candidates; it
 cannot fall back to legacy target audio/text.
+
+To choose a take yourself later, create/edit
+`work/candidate_overrides.json` and rerun `select`—no generation is needed:
+
+```json
+{
+  "7": 3,
+  "31": 2
+}
+```
+
+The keys are turn IDs and values are retained candidate numbers. The selected
+WAV is rebuilt at the correct loudness, then `assemble` can be run again.
 
 ### 5. Assemble and validate
 

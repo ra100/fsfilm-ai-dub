@@ -296,7 +296,12 @@ def default_config(project: Path, name: str, audio: Path, source: Path, target: 
             "target": {"code": target_code, "name": LANGUAGE_NAMES.get(target_code.casefold(), target_code), "asr_language": target_code},
         },
         "layout": {"work_dir": "work", "output_dir": "output"},
-        "grouping": {"script_lookahead": 10, "max_gap_seconds": 6.0, "max_turn_seconds": 30.0},
+        "grouping": {
+            "script_lookahead": 10,
+            "max_gap_seconds": 6.0,
+            "max_turn_seconds": 30.0,
+            "merge_consecutive_same_role": True,
+        },
         "translation": {
             "words_per_second": 2.35,
             "accent": "Neutral General American English",
@@ -304,11 +309,12 @@ def default_config(project: Path, name: str, audio: Path, source: Path, target: 
         },
         "render": {
             "engine": "indextts2_source_emotion",
-            "variants": 2,
+            "variants": 3,
             "seed": 3200,
             "emotion_alpha": 0.90,
             "temperature": 0.80,
             "minimum_gap_seconds": 0.08,
+            "minimum_emotion_seconds": 1.20,
         },
         "quality": {
             "minimum_role_confidence": 0.55,
@@ -391,12 +397,13 @@ def build(args: argparse.Namespace) -> None:
     target_by_number = {cue.number: cue for cue in target}
     max_gap = float(grouping.get("max_gap_seconds", 6.0))
     max_turn = float(grouping.get("max_turn_seconds", 30.0))
+    merge_same_role = bool(grouping.get("merge_consecutive_same_role", True))
     groups: list[dict[str, Any]] = []
     for row in assigned:
-        key = (row["role"], row["script_index"])
         new_turn = (
             not groups
-            or groups[-1]["key"] != list(key)
+            or groups[-1]["role"] != row["role"]
+            or not merge_same_role and groups[-1]["script_indices"] != [row["script_index"]]
             or row["start"] - float(groups[-1]["source_end"]) > max_gap
             or row["end"] - float(groups[-1]["source_start"]) > max_turn
         )
@@ -404,9 +411,10 @@ def build(args: argparse.Namespace) -> None:
             groups.append(
                 {
                     "group": len(groups) + 1,
-                    "key": list(key),
                     "role": row["role"],
                     "script_line": row["script_line"],
+                    "script_lines": [row["script_line"]],
+                    "script_indices": [row["script_index"]],
                     "source_cues": [],
                     "source_start": round(row["start"], 3),
                     "source_end": round(row["end"], 3),
@@ -422,24 +430,29 @@ def build(args: argparse.Namespace) -> None:
         group["source_text_parts"].append(row["text"])
         group["target_cues"].extend(item.number for item in target_map[row["cue"]])
         group["role_confidence"].append(row["role_confidence"])
+        if row["script_index"] not in group["script_indices"]:
+            group["script_indices"].append(row["script_index"])
+            group["script_lines"].append(row["script_line"])
 
     # A source subtitle track can omit an off-screen/radio line that still has
     # target-language captions. Detect an isolated skipped script row and use
     # its target-SRT gap as timing. This keeps an off-screen/radio transmission
     # as its own speaker turn instead of absorbing it into the next actor.
-    used_script_indices = {int(group["key"][1]) for group in groups}
+    used_script_indices = {
+        int(index) for group in groups for index in group["script_indices"]
+    }
     missing_indices = [index for index in range(len(script)) if index not in used_script_indices]
     coverage_review: list[dict[str, Any]] = []
     inserted: list[dict[str, Any]] = []
     for missing_index in missing_indices:
-        previous = [group for group in groups if int(group["key"][1]) < missing_index]
-        following = [group for group in groups if int(group["key"][1]) > missing_index]
-        previous_group = max(previous, key=lambda group: int(group["key"][1])) if previous else None
-        following_group = min(following, key=lambda group: int(group["key"][1])) if following else None
+        previous = [group for group in groups if max(group["script_indices"]) < missing_index]
+        following = [group for group in groups if min(group["script_indices"]) > missing_index]
+        previous_group = max(previous, key=lambda group: max(group["script_indices"])) if previous else None
+        following_group = min(following, key=lambda group: min(group["script_indices"])) if following else None
         skipped_between = [
             index for index in missing_indices
-            if (previous_group is None or int(previous_group["key"][1]) < index)
-            and (following_group is None or index < int(following_group["key"][1]))
+            if (previous_group is None or max(previous_group["script_indices"]) < index)
+            and (following_group is None or index < min(following_group["script_indices"]))
         ]
         if not previous_group or not following_group or len(skipped_between) != 1:
             coverage_review.append({
@@ -464,9 +477,10 @@ def build(args: argparse.Namespace) -> None:
         inserted.append(
             {
                 "group": 0,
-                "key": [script[missing_index]["role"], missing_index],
                 "role": script[missing_index]["role"],
                 "script_line": script[missing_index]["line"],
+                "script_lines": [script[missing_index]["line"]],
+                "script_indices": [missing_index],
                 "source_cues": [],
                 "source_start": round(min(cue.start for cue in target_gap), 3),
                 "source_end": round(max(cue.end for cue in target_gap), 3),
@@ -477,7 +491,7 @@ def build(args: argparse.Namespace) -> None:
             }
         )
     groups.extend(inserted)
-    groups.sort(key=lambda group: (float(group["source_start"]), int(group["key"][1])))
+    groups.sort(key=lambda group: (float(group["source_start"]), min(group["script_indices"])))
     for number, group in enumerate(groups, 1):
         group["group"] = number
     wps = float(config.get("translation", {}).get("words_per_second", 2.35))
@@ -942,16 +956,27 @@ def render(args: argparse.Namespace) -> None:
         role_cfg = config.get("roles", {}).get(role, {})
         emotion_source = role_cfg.get("emotion_audio")
         emotion = group_dir / "source_emotion.wav"
+        speaker = resolve_project_path(project, references[role]["path"])
+        minimum_emotion = float(render_cfg.get("minimum_emotion_seconds", 1.20))
         if emotion_source:
             source = resolve_project_path(project, emotion_source)
             run(["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ac", "1", "-ar", "22050", str(emotion)])
+            emotion_method = "configured_role_emotion"
+        elif float(group["source_span"]) < minimum_emotion:
+            # A fraction-of-a-second source prompt is too little evidence for
+            # stable prosody. Identity is already carried by speaker; use the
+            # reviewed actor reference as a safe emotion/voice anchor instead.
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(speaker), "-ac", "1", "-ar", "22050", str(emotion)])
+            emotion_method = "actor_reference_for_short_source_turn"
         elif not emotion.exists() or args.force:
             run([
                 "ffmpeg", "-y", "-v", "error", "-ss", f"{float(group['source_start']):.3f}",
                 "-t", f"{float(group['source_span']):.3f}", "-i", str(audio),
                 "-ac", "1", "-ar", "22050", str(emotion),
             ])
-        speaker = resolve_project_path(project, references[role]["path"])
+            emotion_method = "source_turn"
+        else:
+            emotion_method = "existing_source_turn"
         candidates = []
         for variant in range(1, variants + 1):
             output = group_dir / f"candidate_{variant:02d}.wav"
@@ -966,7 +991,13 @@ def render(args: argparse.Namespace) -> None:
                     num_beams=3, interval_silence=80, verbose=False,
                 )
             candidates.append({"variant": variant, "seed": seed, "path": rel_to_project(project, output), "duration": round(audio_duration(output), 3)})
-        group["render"] = {"method": "A_lipsync", "emotion": rel_to_project(project, emotion), "candidates": candidates, "selection": None}
+        group["render"] = {
+            "method": "A_lipsync",
+            "emotion": rel_to_project(project, emotion),
+            "emotion_method": emotion_method,
+            "candidates": candidates,
+            "selection": None,
+        }
         save(manifest_path(project, config), groups)
     print("Fresh source-conditioned A-only rendering complete. No legacy or alternative-model audio was used.")
 
@@ -1009,7 +1040,14 @@ def select(args: argparse.Namespace) -> None:
     max_overrun = float(quality.get("maximum_overrun_seconds", 0.35))
     gap = float(config.get("render", {}).get("minimum_gap_seconds", 0.08))
     project_duration = audio_duration(project_audio(project, config))
-    rows = []
+    work = work_dir(project, config)
+    overrides_path = Path(args.overrides) if args.overrides else work / "candidate_overrides.json"
+    overrides = load(overrides_path) if overrides_path.exists() else {}
+    if not isinstance(overrides, dict):
+        die(f"candidate overrides must be a JSON object: {overrides_path}")
+    if not overrides_path.exists():
+        save(overrides_path, overrides)
+    rows, audition_rows = [], []
     for index, group in enumerate(groups):
         if requested is not None and int(group["group"]) not in requested:
             continue
@@ -1030,7 +1068,30 @@ def select(args: argparse.Namespace) -> None:
             target_span = max(0.35, float(group["source_span"]))
             score = (1.0 - recall) * 12.0 + (0.0 if ending else 5.0) + abs(duration - target_span) / target_span * 1.4 + overrun / target_span * 18.0
             analyzed.append({**candidate, "transcript": transcript, "word_recall": round(recall, 3), "ending_present": ending, "duration": round(duration, 3), "available_duration": round(available, 3), "overrun": round(overrun, 3), "score": round(score, 4)})
-        best = min(analyzed, key=lambda item: item["score"])
+        requested_candidate = overrides.get(str(group["group"]))
+        if requested_candidate is not None:
+            try:
+                requested_candidate = int(requested_candidate)
+            except (TypeError, ValueError):
+                die(f"candidate override for group {group['group']} must be a variant number")
+            selected_matches = [item for item in analyzed if int(item["variant"]) == requested_candidate]
+            if not selected_matches:
+                available_variants = ", ".join(str(item["variant"]) for item in analyzed)
+                die(f"candidate override for group {group['group']} requests {requested_candidate}; available: {available_variants}")
+            best = selected_matches[0]
+            selection_mode = "manual_override"
+        else:
+            best = min(analyzed, key=lambda item: item["score"])
+            selection_mode = "automatic_score"
+        for item in analyzed:
+            audition_rows.append({
+                "group": group["group"], "role": group["role"], "variant": item["variant"],
+                "selected": int(item["variant"]) == int(best["variant"]), "selection_mode": selection_mode,
+                "path": item["path"], "duration": item["duration"], "available_duration": item["available_duration"],
+                "word_recall": item["word_recall"], "ending_present": item["ending_present"],
+                "overrun": item["overrun"], "score": item["score"], "transcript": item["transcript"],
+                "text": expected,
+            })
         selected = resolve_project_path(project, best["path"]).parent / "selected.wav"
         gain = normalize_to_source(resolve_project_path(project, group["render"]["emotion"]), resolve_project_path(project, best["path"]), selected)
         review = []
@@ -1043,12 +1104,14 @@ def select(args: argparse.Namespace) -> None:
         group["render"]["selection"] = {
             "method": "A_lipsync", "candidate": best["variant"], "path": rel_to_project(project, selected),
             "duration": round(audio_duration(selected), 3), "gain_db": gain, "review": review,
+            "selection_mode": selection_mode,
             "candidates": analyzed,
         }
-        rows.append({"group": group["group"], "role": group["role"], "candidate": best["variant"], "duration": group["render"]["selection"]["duration"], "available_duration": best["available_duration"], "word_recall": best["word_recall"], "ending_present": best["ending_present"], "overrun": best["overrun"], "review": "; ".join(review), "text": expected})
+        rows.append({"group": group["group"], "role": group["role"], "candidate": best["variant"], "selection_mode": selection_mode, "duration": group["render"]["selection"]["duration"], "available_duration": best["available_duration"], "word_recall": best["word_recall"], "ending_present": best["ending_present"], "overrun": best["overrun"], "review": "; ".join(review), "text": expected})
         save(manifest_path(project, config), groups)
-    write_csv(work_dir(project, config) / "selection.csv", rows, ["group", "role", "candidate", "duration", "available_duration", "word_recall", "ending_present", "overrun", "review", "text"])
-    print(f"A-only selection complete; {sum(bool(row['review']) for row in rows)} turn(s) need review.")
+    write_csv(work / "selection.csv", rows, ["group", "role", "candidate", "selection_mode", "duration", "available_duration", "word_recall", "ending_present", "overrun", "review", "text"])
+    write_csv(work / "candidate_audition.csv", audition_rows, ["group", "role", "variant", "selected", "selection_mode", "path", "duration", "available_duration", "word_recall", "ending_present", "overrun", "score", "transcript", "text"])
+    print(f"A-only selection complete; {sum(bool(row['review']) for row in rows)} turn(s) need review. Raw variants remain in work/renders; edit {overrides_path} and rerun select to choose another.")
 
 
 def assemble(args: argparse.Namespace) -> None:
@@ -1182,7 +1245,7 @@ def main() -> None:
     p = sub.add_parser("render", help="render fresh source-emotion A-only candidates")
     add_config_argument(p); p.add_argument("--groups"); p.add_argument("--variants", type=int); p.add_argument("--force", action="store_true"); p.set_defaults(func=render)
     p = sub.add_parser("select", help="select only among A-only candidates")
-    add_config_argument(p); p.add_argument("--groups"); p.add_argument("--asr-model", default="large-v3-turbo"); p.set_defaults(func=select)
+    add_config_argument(p); p.add_argument("--groups"); p.add_argument("--asr-model", default="large-v3-turbo"); p.add_argument("--overrides", help="candidate_overrides.json; maps group IDs to retained variant numbers"); p.set_defaults(func=select)
     p = sub.add_parser("assemble", help="assemble no-speed dialogue stem and audio-aligned SRT")
     add_config_argument(p); p.add_argument("--output"); p.add_argument("--srt"); p.add_argument("--allow-overlap", action="store_true"); p.set_defaults(func=assemble)
     p = sub.add_parser("validate", help="validate the A-only final master")
