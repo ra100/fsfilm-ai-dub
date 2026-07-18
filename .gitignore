@@ -1,0 +1,44 @@
+# This repository is intentionally an allow-list.  New files must be explicitly
+# unignored below before they can be committed.
+*
+!.gitignore
+!README.md
+!REUSABLE_PIPELINE.md
+!requirements.txt
+!reusable_pipeline.py
+
+# Local runtime/model/vendor data are deliberately never versioned.
+.venv/
+models/
+third_party/
+work/
+output/
+projects/
+__pycache__/
+*.py[cod]
+
+# Production media, exports, and user-local configuration.
+*.wav
+*.wave
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.srt
+*.ass
+*.vtt
+*.mov
+*.mp4
+*.mkv
+*.avi
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*credentials*
+*secret*
+*token*

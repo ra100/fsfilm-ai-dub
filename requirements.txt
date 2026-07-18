@@ -1,0 +1,8 @@
+# Install a CUDA-enabled PyTorch build appropriate for the workstation first.
+# IndexTTS2 itself is installed separately under third_party/index-tts; see
+# REUSABLE_PIPELINE.md.
+faster-whisper
+librosa
+numpy
+soundfile
+transformers
