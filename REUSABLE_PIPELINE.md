@@ -15,7 +15,7 @@ source audio + approved actor reference + approved lip-sync text
                        ASR / duration / ending QA
                                   │
                                   ▼
-                   no-speed dialogue stem + audio-aligned SRT
+                   no-speed dialogue stem + original-timing SRT
 ```
 
 There is no hybrid stage. The pipeline never substitutes an old subtitle take,
@@ -261,8 +261,13 @@ $PY ai_dub/reusable_pipeline.py validate --config "$PIPE" --strict
 The output folder contains:
 
 - `dialogue_<target>_a_lipsync.wav` — 48 kHz, mono, 24-bit dialogue stem;
-- `dialogue_<target>_a_lipsync.srt` — subtitle boundaries based on the rendered
-  audio, not the old target SRT.
+- `dialogue_<target>_a_lipsync.srt` — the original target SRT's cue count,
+  starts, and ends, with the approved dialogue text substituted. When a
+  revised grouped line needs reflowing, only its text is redistributed across
+  its existing cue slots; no subtitle timing is changed.
+- `dialogue_<target>_a_lipsync_audio_schedule.srt` — an optional technical
+  view based on the selected rendered takes' actual starts and ends. This is
+  useful for auditing audio, not for replacing the source subtitle layout.
 
 `assemble` refuses turns that overlap the following source turn by more than
 the configured threshold. Fix their translation or timing; do **not** use

@@ -127,6 +127,80 @@ def write_srt(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
 
 
+def read_srt_display_text(path: Path) -> dict[int, str]:
+    """Return each cue's text while preserving its original visual line breaks."""
+    raw = path.read_text(encoding="utf-8-sig").replace("\r", "").strip()
+    display_text: dict[int, str] = {}
+    for block in re.split(r"\n\s*\n", raw):
+        lines = block.split("\n")
+        if len(lines) < 3:
+            continue
+        try:
+            number = int(lines[0].strip())
+        except ValueError:
+            continue
+        display_text[number] = "\n".join(line.strip() for line in lines[2:] if line.strip())
+    return display_text
+
+
+def write_srt_cues(path: Path, cues: Iterable[Cue], text_by_number: dict[int, str]) -> None:
+    blocks = [
+        f"{cue.number}\n{stamp(cue.start)} --> {stamp(cue.end)}\n{text_by_number[cue.number]}"
+        for cue in cues
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def split_subtitle_text(text: str, original_cues: list[Cue], target_code: str) -> list[str]:
+    """Reflow revised dialogue into existing cue boundaries without changing them."""
+    words = text.split()
+    if len(original_cues) == 1:
+        return [text]
+    if not words:
+        return [""] * len(original_cues)
+    weights = [max(1, len(tokenise(cue.text, target_code))) for cue in original_cues]
+    total_weight = sum(weights)
+    boundaries: list[int] = []
+    cumulative = 0
+    previous = 0
+    for index, weight in enumerate(weights[:-1], 1):
+        cumulative += weight
+        # Keep one word available for each remaining cue where possible.
+        lower = previous + 1 if len(words) >= len(original_cues) else previous
+        upper = len(words) - (len(original_cues) - index) if len(words) >= len(original_cues) else len(words)
+        boundary = max(lower, min(upper, round(len(words) * cumulative / total_weight)))
+        boundaries.append(boundary)
+        previous = boundary
+    return [" ".join(words[start:end]).strip() for start, end in zip([0, *boundaries], [*boundaries, len(words)])]
+
+
+def write_original_timing_srt(project: Path, config: dict[str, Any], groups: list[dict[str, Any]], path: Path) -> None:
+    """Export final dialogue with the supplied target SRT's cue count and times.
+
+    Unchanged groups preserve the target SRT wording and line segmentation exactly.
+    Revised groups are reflowed across their original cue slots; this changes only
+    text, never a cue's start or end.
+    """
+    cues = read_srt(target_srt(project, config))
+    by_number = {cue.number: cue for cue in cues}
+    text_by_number = read_srt_display_text(target_srt(project, config))
+    for group in groups:
+        numbers = [number for number in group.get("target_cues", []) if number in by_number]
+        if not numbers:
+            continue
+        original = " ".join(by_number[number].text for number in numbers).strip()
+        revised = clean_generation(str(group.get("lip_sync_text", "")))
+        # Keeping the existing per-cue text prevents needless subtitle reflow
+        # when the approved dialogue is already the target subtitle wording.
+        if revised == original:
+            continue
+        slots = [by_number[number] for number in numbers]
+        for number, replacement in zip(numbers, split_subtitle_text(revised, slots, target_name(config))):
+            text_by_number[number] = replacement
+    write_srt_cues(path, cues, text_by_number)
+
+
 def audio_duration(path: Path) -> float:
     result = subprocess.run(
         [
@@ -1124,6 +1198,10 @@ def assemble(args: argparse.Namespace) -> None:
     target = target_name(config)
     output = Path(args.output).resolve() if args.output else output_root / f"dialogue_{target}_a_lipsync.wav"
     subtitles = Path(args.srt).resolve() if args.srt else output_root / f"dialogue_{target}_a_lipsync.srt"
+    schedule_subtitles = (
+        Path(args.schedule_srt).resolve() if args.schedule_srt
+        else output_root / f"dialogue_{target}_a_lipsync_audio_schedule.srt"
+    )
     duration = audio_duration(project_audio(project, config))
     max_overlap = float(config.get("quality", {}).get("maximum_overlap_seconds", 0.05))
     schedule, conflicts = [], []
@@ -1158,9 +1236,10 @@ def assemble(args: argparse.Namespace) -> None:
     filters.append("".join(labels) + f"amix=inputs={len(labels)}:duration=first:normalize=0,atrim=duration={duration:.6f}[out]")
     command.extend(["-filter_complex", ";".join(filters), "-map", "[out]", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s24le", str(output)])
     run(command)
-    write_srt(subtitles, schedule)
+    write_original_timing_srt(project, config, groups, subtitles)
+    write_srt(schedule_subtitles, schedule)
     save(work_dir(project, config) / "schedule.json", schedule)
-    print(f"Wrote {output} and audio-aligned subtitles {subtitles}; overlaps allowed: {len(conflicts)}.")
+    print(f"Wrote {output}, original-timing subtitles {subtitles}, and audio-schedule subtitles {schedule_subtitles}; overlaps allowed: {len(conflicts)}.")
 
 
 def validate(args: argparse.Namespace) -> None:
@@ -1248,8 +1327,8 @@ def main() -> None:
     add_config_argument(p); p.add_argument("--groups"); p.add_argument("--variants", type=int); p.add_argument("--force", action="store_true"); p.set_defaults(func=render)
     p = sub.add_parser("select", help="select only among A-only candidates")
     add_config_argument(p); p.add_argument("--groups"); p.add_argument("--asr-model", default="large-v3-turbo"); p.add_argument("--overrides", help="candidate_overrides.json; maps group IDs to retained variant numbers"); p.set_defaults(func=select)
-    p = sub.add_parser("assemble", help="assemble no-speed dialogue stem and audio-aligned SRT")
-    add_config_argument(p); p.add_argument("--output"); p.add_argument("--srt"); p.add_argument("--allow-overlap", action="store_true"); p.set_defaults(func=assemble)
+    p = sub.add_parser("assemble", help="assemble no-speed dialogue stem and original-timing SRT")
+    add_config_argument(p); p.add_argument("--output"); p.add_argument("--srt"); p.add_argument("--schedule-srt", help="optional audio-schedule SRT path"); p.add_argument("--allow-overlap", action="store_true"); p.set_defaults(func=assemble)
     p = sub.add_parser("validate", help="validate the A-only final master")
     add_config_argument(p); p.add_argument("--output"); p.add_argument("--strict", action="store_true"); p.set_defaults(func=validate)
     p = sub.add_parser("status", help="show current project stage")
