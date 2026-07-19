@@ -670,8 +670,10 @@ def validate_translation_text(text: str, config: dict[str, Any]) -> list[str]:
     if not text.strip():
         return ["empty translation"]
     target = target_name(config)
-    if target == "en" and re.search(r"[^\x00-\x7F]", text):
-        issues.append("non-ASCII characters in English text")
+    # Curly apostrophes, typographic dashes and Latin names are normal English
+    # subtitle punctuation. Flag non-Latin scripts instead of rejecting them.
+    if target == "en" and re.search(r"[^\u0000-\u024F\u2010-\u202F]", text):
+        issues.append("non-Latin characters in English text")
     if re.search(r"(?:translation|english|output)\s*:", text, flags=re.I):
         issues.append("model label leaked into dialogue")
     return issues
