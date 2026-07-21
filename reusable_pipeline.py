@@ -322,6 +322,22 @@ def assign_script_rows(source: list[Cue], script: list[dict[str, Any]], lookahea
         # not advance to a later actor unless the evidence is clearly stronger.
         if best_index > cursor and best_score < current_score + 0.10:
             best_index, best_score = cursor, current_score
+        # A common subtitle pattern is a call-and-response where two actors
+        # repeat the same short acknowledgement in consecutive cues. The
+        # normal fragment-preservation rule above would otherwise keep both
+        # cues on the first script row because their text scores tie. Advance
+        # only for an exact repeated cue at a role handoff with equally strong
+        # evidence for the next script row.
+        if assigned and best_index == cursor and cursor + 1 < len(script):
+            previous = assigned[-1]
+            next_score = score_text(cue.text, script[cursor + 1]["text"])
+            if (
+                previous["script_index"] == cursor
+                and normalize(previous["text"]) == normalize(cue.text)
+                and script[cursor + 1]["role"] != script[cursor]["role"]
+                and next_score >= best_score - 0.02
+            ):
+                best_index, best_score = cursor + 1, next_score
         cursor = best_index
         assigned.append(
             {
@@ -721,6 +737,13 @@ def parse_groups(value: str) -> set[int]:
         die(f"invalid group list: {value!r}")
 
 
+def parse_roles(value: str) -> set[str]:
+    roles = {item.strip() for item in value.split(",") if item.strip()}
+    if not roles:
+        die("role list is empty")
+    return roles
+
+
 def tokenise(text: str, target_code: str) -> list[str]:
     if target_code.casefold().split("-")[0] in CJK_CODES:
         return [character for character in text.casefold() if character.isalnum()]
@@ -924,8 +947,16 @@ def make_references(args: argparse.Namespace) -> None:
     audio = project_audio(project, config)
     candidates_dir = work / "reference_candidates"
     min_db = float(config.get("quality", {}).get("minimum_reference_active_db", -42.0))
+    all_roles = sorted({group["role"] for group in groups})
+    requested_roles = parse_roles(args.roles) if args.roles else None
+    unknown_roles = sorted((requested_roles or set()) - set(all_roles))
+    if unknown_roles:
+        die("unknown role(s): " + ", ".join(unknown_roles))
+    roles = sorted(requested_roles) if requested_roles else all_roles
     candidates: list[dict[str, Any]] = []
     for group in groups:
+        if group["role"] not in roles:
+            continue
         path = candidates_dir / group["role"] / f"{int(group['group']):03d}.wav"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or args.force:
@@ -942,18 +973,24 @@ def make_references(args: argparse.Namespace) -> None:
     write_csv(work / "reference_candidates.csv", candidates, ["group", "role", "path", "duration", "active_ratio", "active_db", "usable", "text"])
     selection_path = work / "reference_selection.json"
     selected = load(selection_path) if selection_path.exists() else {}
-    roles = sorted({group["role"] for group in groups})
-    if not selected:
-        for role in roles:
+    selection_changed, needs_review = False, []
+    for role in roles:
+        if role not in selected:
             best = sorted(
                 [row for row in candidates if row["role"] == role and row["usable"]],
                 key=lambda row: (float(row["active_ratio"]) * float(row["duration"]), float(row["duration"])), reverse=True,
             )[: args.clips_per_role]
             selected[role] = {"groups": [row["group"] for row in best], "review": "listen before use"}
+            selection_changed = True
+            if not config.get("roles", {}).get(role, {}).get("reference_audio"):
+                needs_review.append(role)
+    if selection_changed:
         save(selection_path, selected)
+    if needs_review:
         print(f"Wrote reference candidates and initial selections. Listen/edit {selection_path}, then rerun make-references.")
         return
-    references = {}
+    map_path = work / "reference_map.json"
+    references = load(map_path) if map_path.exists() else {}
     by_group = {int(row["group"]): row for row in candidates}
     for role in roles:
         role_cfg = config.get("roles", {}).get(role, {})
@@ -984,8 +1021,8 @@ def make_references(args: argparse.Namespace) -> None:
             "source": origin,
             "inputs": [rel_to_project(project, path) for path in inputs],
         }
-    save(work / "reference_map.json", references)
-    print(f"Created {len(references)} actor references in {work / 'references'}.")
+    save(map_path, references)
+    print(f"Created/updated {len(roles)} actor reference(s) in {work / 'references'}.")
 
 
 def verify_gpu() -> None:
@@ -1322,7 +1359,7 @@ def main() -> None:
     p = sub.add_parser("apply-timing", help="apply human-approved timing_overrides.json")
     add_config_argument(p); p.add_argument("--overrides"); p.set_defaults(func=apply_timing)
     p = sub.add_parser("make-references", help="extract and build actor-reference WAVs")
-    add_config_argument(p); p.add_argument("--clips-per-role", type=int, default=3); p.add_argument("--force", action="store_true"); p.set_defaults(func=make_references)
+    add_config_argument(p); p.add_argument("--roles", help="comma-separated role IDs to prepare"); p.add_argument("--clips-per-role", type=int, default=3); p.add_argument("--force", action="store_true"); p.set_defaults(func=make_references)
     p = sub.add_parser("render", help="render fresh source-emotion A-only candidates")
     add_config_argument(p); p.add_argument("--groups"); p.add_argument("--variants", type=int); p.add_argument("--force", action="store_true"); p.set_defaults(func=render)
     p = sub.add_parser("select", help="select only among A-only candidates")

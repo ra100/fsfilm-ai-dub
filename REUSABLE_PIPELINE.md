@@ -211,6 +211,21 @@ Then run the same command once more to create `work/references/<ROLE>.wav`.
 Never accept an almost-silent automated reference: add a clean dedicated source
 through `roles.<ROLE>.reference_audio` in `pipeline.json`.
 
+When `roles.<ROLE>.reference_audio` is configured, the command creates that
+role's reference immediately; it does not require a source-clip review first.
+For an isolated actor refresh without touching other roles, use:
+
+```bash
+$PY ai_dub/reusable_pipeline.py make-references --config "$PIPE" --roles TAL
+$INDEXPY ai_dub/reusable_pipeline.py render --config "$PIPE" --groups 16,22,26 --variants 3
+```
+
+`--roles` and `--groups` are intentionally separate: the former prepares voice
+identity, while the latter controls which complete dialogue turns are rendered.
+The source-SRT/script alignment also detects identical consecutive short cues
+at a role handoff, so a reply from a second actor is not silently merged into
+the first actor's turn.
+
 ### 4. Render, select and review
 
 Render one complete, source-conditioned A-style turn at a time. It uses the
