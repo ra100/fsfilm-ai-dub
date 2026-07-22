@@ -23,6 +23,7 @@ from local_ui import (
     load_csv,
     project_snapshot,
     project_paths,
+    update_group_role,
     update_pause_overrides,
     write_csv_atomic,
 )
@@ -73,12 +74,14 @@ def make_project(root: Path) -> Path:
                     "source_text": "Ahoj",
                     "lip_sync_text": "Hello",
                     "translation_state": "approved",
+                    "script_indices": [0],
                     "render": {"candidates": [], "selection": None},
                 }
             ]
         ),
         encoding="utf-8",
     )
+    (project / "script.txt").write_text("PUL: Ahoj\n", encoding="utf-8")
     (project / "work" / "translation_review.csv").write_text(
         "group,role,lip_sync_text,approved,translator_notes\n1,PUL,Hello,yes,\n",
         encoding="utf-8",
@@ -154,6 +157,38 @@ class LocalUiTests(unittest.TestCase):
             self.assertEqual(rendered, "Hello... there")
             self.assertEqual(markers[0]["duration_ms"], 350)
             self.assertEqual(summary["requested_pause_seconds"], 0.35)
+
+    def test_character_correction_updates_script_and_invalidates_voice_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            render_dir = project / "work" / "renders" / "001_PUL"
+            render_dir.mkdir(parents=True)
+            candidate_path = render_dir / "candidate_01.wav"
+            sf.write(candidate_path, np.zeros(800, dtype=np.float32), 8000)
+            manifest_path = project / "work" / "turn_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest[0]["render"] = {
+                "candidates": [{"variant": 1, "path": "work/renders/001_PUL/candidate_01.wav"}],
+                "selection": {"candidate": 1, "path": "work/renders/001_PUL/candidate_01.wav"},
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            (project / "work" / "candidate_overrides.json").write_text('{"1": 1}\n', encoding="utf-8")
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+
+            result = update_group_role(record, 1, "tal")
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["role"], "TAL")
+            self.assertEqual(result["affected_groups"], [1])
+            self.assertEqual((project / "script.txt").read_text(encoding="utf-8"), "TAL: Ahoj\n")
+            updated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_manifest[0]["role"], "TAL")
+            self.assertEqual(updated_manifest[0]["render"]["candidates"], [])
+            self.assertIsNone(updated_manifest[0]["render"]["selection"])
+            self.assertEqual(load_csv(project / "work" / "translation_review.csv")[1][0]["role"], "TAL")
+            self.assertEqual(json.loads((project / "work" / "candidate_overrides.json").read_text(encoding="utf-8")), {})
 
     def test_project_status_and_translation_edit_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

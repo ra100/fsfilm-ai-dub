@@ -56,6 +56,7 @@ function App() {
   const [pauseSummary, setPauseSummary] = useState<PauseSummary | null>(null)
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
+  const [roleDraft, setRoleDraft] = useState('')
   const [notes, setNotes] = useState('')
   const [approved, setApproved] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
@@ -66,6 +67,8 @@ function App() {
   const [loopTurn, setLoopTurn] = useState(true)
   const [preRoll, setPreRoll] = useState(0.4)
   const [postRoll, setPostRoll] = useState(0.4)
+  const [timelineZoom, setTimelineZoom] = useState(1)
+  const [timelineStart, setTimelineStart] = useState(0)
 
   const activeProject = projects.find((project) => project.id === projectId) ?? null
   const activeGroup = groups.find((group) => group.group === selectedGroup) ?? null
@@ -158,11 +161,16 @@ function App() {
   }
 
   useEffect(() => { refreshProjects().catch((error: Error) => setMessage(error.message)) }, [])
-  useEffect(() => { refreshProjectData().catch((error: Error) => setMessage(error.message)) }, [projectId])
+  useEffect(() => {
+    setTimelineZoom(1)
+    setTimelineStart(0)
+    refreshProjectData().catch((error: Error) => setMessage(error.message))
+  }, [projectId])
   useEffect(() => {
     const row = selectedGroup ? translations.get(selectedGroup) : undefined
     const group = groups.find((item) => item.group === selectedGroup)
     setDraft(row?.lip_sync_text ?? group?.lip_sync_text ?? '')
+    setRoleDraft(group?.role ?? '')
     setNotes(row?.translator_notes ?? '')
     setApproved(row?.approved === 'yes')
   }, [selectedGroup, translations, groups])
@@ -197,6 +205,25 @@ function App() {
         method: 'PUT', body: JSON.stringify({ lip_sync_text: draft, approved, translator_notes: notes }),
       })
       setMessage(`Group ${selectedGroup} saved. Apply translations before rendering.`)
+      await refreshProjectData()
+    } catch (error) {
+      setMessage((error as Error).message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function changeRole(event: FormEvent) {
+    event.preventDefault()
+    if (!projectId || !activeGroup || !roleDraft.trim()) return
+    setBusy('role')
+    try {
+      const result = await api<{ role: string; previous_role: string; affected_groups: number[]; changed: boolean; next_step: string }>(`/api/projects/${projectId}/groups/${activeGroup.group}/role`, {
+        method: 'PUT', body: JSON.stringify({ role: roleDraft }),
+      })
+      setRoleDraft(result.role)
+      const affected = result.affected_groups.length ? ` Groups ${result.affected_groups.join(', ')} now need fresh takes.` : ''
+      setMessage(result.changed ? `Character corrected: ${result.previous_role} → ${result.role}.${affected} ${result.next_step}` : result.next_step)
       await refreshProjectData()
     } catch (error) {
       setMessage((error as Error).message)
@@ -276,7 +303,7 @@ function App() {
 
     {projects.length === 0 ? <section className="empty-start"><h2>Start by dropping a short’s source assets</h2><p>Import the dialogue audio, source and target subtitles, script, and optional video. Everything stays local.</p><button onClick={() => setShowImport(true)}>Import a new project</button></section> : <>
       <section className="project-bar" aria-label="Project selection">
-        <label>Project<select value={projectId} onChange={(event) => { setSelectedGroup(null); setPlayhead(0); setProjectId(event.target.value) }}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+        <label>Project<select value={projectId} onChange={(event) => { setSelectedGroup(null); setPlayhead(0); setTimelineZoom(1); setTimelineStart(0); setProjectId(event.target.value) }}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
         {activeProject && <div className="metrics"><span><b>{activeProject.counts.turns}</b> turns</span><span><b>{activeProject.counts.approved_translations}</b> approved</span><span><b>{activeProject.counts.rendered_turns}</b> rendered</span><span><b>{activeProject.counts.selected_turns}</b> selected</span></div>}
       </section>
 
@@ -285,12 +312,18 @@ function App() {
 
         <section className="review-panel">{activeGroup ? <>
           <div className="turn-heading"><div><p className="eyebrow">TURN {String(activeGroup.group).padStart(2, '0')} · {activeGroup.role}</p><h2>{timestamp(activeGroup.source_start)}–{timestamp(activeGroup.source_end)}</h2></div><div className="turn-facts"><span>{activeGroup.target_word_budget} word budget</span><span>{activeGroup.candidate_count} candidates</span>{activeGroup.selection?.candidate && <span>selected C{activeGroup.selection.candidate}</span>}</div></div>
+          <form className="role-editor" onSubmit={changeRole}>
+            <label>Character / actor<input list="known-roles" value={roleDraft} onChange={(event) => setRoleDraft(event.target.value)} placeholder="e.g. TAL" required /></label>
+            <datalist id="known-roles">{[...new Set([...roles, ...rolesInfo.map((role) => role.role)])].sort().map((role) => <option key={role} value={role} />)}</datalist>
+            <button className="secondary" type="submit" disabled={busy !== null || roleDraft.trim().toUpperCase() === activeGroup.role}>Correct character</button>
+            <span>Updates the matching script line and retires old takes for its affected turn(s).</span>
+          </form>
           <section className="picture-card" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void uploadVideo(file) }}>
             {activeProject?.has_video ? <video ref={videoRef} muted preload="metadata" src={`${apiBase}/api/projects/${projectId}/media/video`} /> : <div className="video-placeholder"><strong>Drop a picture reference here</strong><span>or <label className="inline-file">choose a video<input type="file" accept="video/*" onChange={(event) => event.target.files?.[0] && void uploadVideo(event.target.files[0])} /></label> to set <code>input.video</code>.</span></div>}
             <audio ref={sourceAudioRef} preload="metadata" src={`${apiBase}/api/projects/${projectId}/media/audio`} onTimeUpdate={(event) => updatePlayhead(event.currentTarget.currentTime)} onPause={() => setIsPlaying(false)} onPlay={() => setIsPlaying(true)} />
             <div className="transport"><button onClick={() => seek(playhead - 1 / 24)} className="secondary">◀ frame</button><button onClick={() => void togglePlayback()}>{isPlaying ? 'Pause' : 'Play source'}</button><button onClick={() => seek(playhead + 1 / 24)} className="secondary">frame ▶</button><button className="secondary" onClick={() => seek(Math.max(0, activeGroup.source_start - preRoll))}>Loop turn</button><label><input type="checkbox" checked={loopTurn} onChange={(event) => setLoopTurn(event.target.checked)} /> loop</label><label>pre <input type="number" min="0" max="3" step="0.1" value={preRoll} onChange={(event) => setPreRoll(Number(event.target.value))} />s</label><label>post <input type="number" min="0" max="3" step="0.1" value={postRoll} onChange={(event) => setPostRoll(Number(event.target.value))} />s</label></div>
           </section>
-          {waveform && <CharacterTimeline waveform={waveform} groups={groups} selectedGroup={selectedGroup} playhead={playhead} onSeek={seek} onSelect={(group) => { const fullGroup = groups.find((item) => item.group === group.group); if (fullGroup) selectTurn(fullGroup) }} />}
+          {waveform && <CharacterTimeline waveform={waveform} groups={groups} selectedGroup={selectedGroup} playhead={playhead} zoom={timelineZoom} viewStart={timelineStart} onZoomChange={setTimelineZoom} onViewStartChange={setTimelineStart} onSeek={seek} onSelect={(group) => { const fullGroup = groups.find((item) => item.group === group.group); if (fullGroup) selectTurn(fullGroup) }} />}
           {candidates?.candidates.length ? <section className="candidate-panel"><div className="panel-title"><div><h3>Candidate audition</h3><span>All raw takes are retained; choose one manually or let the selector score them.</span></div><button className="secondary" disabled={busy !== null} onClick={() => queue('select', { groups: [activeGroup.group] })}>Apply manual choice</button></div><div className="candidate-grid">{candidates.candidates.map((candidate) => <article key={candidate.variant} className={`candidate-card ${candidate.selected ? 'candidate-selected' : ''}`}><div><b>Candidate {candidate.variant}</b>{candidate.selected && <span className="selected-badge">selected</span>}</div><audio controls preload="metadata" src={`${apiBase}/api/projects/${projectId}/groups/${activeGroup.group}/audio/candidate-${candidate.variant}`} /><dl><div><dt>Duration</dt><dd>{candidate.duration?.toFixed(2) ?? '—'} s</dd></div><div><dt>Recall</dt><dd>{candidate.word_recall ?? 'not scored'}</dd></div><div><dt>Overrun</dt><dd>{candidate.overrun?.toFixed(2) ?? '—'} s</dd></div></dl>{candidate.transcript && <p className="candidate-transcript">{candidate.transcript}</p>}<button className="secondary" disabled={busy !== null} onClick={() => void chooseCandidate(candidate.variant)}>{busy === `candidate-${candidate.variant}` ? 'Choosing…' : `Use candidate ${candidate.variant}`}</button></article>)}</div></section> : null}
           <div className="text-compare"><article><h3>Czech source</h3><p>{activeGroup.source_text}</p></article><article><h3>Legacy English</h3><p>{activeGroup.legacy_target_text}</p></article></div>
           <form className="translation-editor" onSubmit={saveTranslation}><label>Reviewed lip-sync English<textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={4} required /></label><div className="editor-footer"><label className="approval"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} /> Approved after bilingual/creative review</label><label className="notes">Notes<input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Pronunciation, intent, or review note" /></label><button type="submit" disabled={busy !== null}>{busy === 'save' ? 'Saving…' : 'Save review'}</button></div></form>

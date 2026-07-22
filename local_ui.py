@@ -106,6 +106,12 @@ def write_json_atomic(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def write_text_atomic(path: Path, value: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
+
+
 def project_slug(name: str) -> str:
     value = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-_")
     if not value or len(value) > 64:
@@ -577,6 +583,139 @@ def validate_role(role: str) -> str:
     return value
 
 
+def update_group_role(record: ProjectRecord, group_number: int, role: str) -> dict[str, Any]:
+    """Correct a script-backed cast assignment and retire stale voice takes.
+
+    ``script_indices`` index only non-empty dialogue rows, not physical file
+    lines.  Updating the actual script keeps a later ``build`` reproducible;
+    updating every manifest group that cites those rows prevents an old actor's
+    rendered candidate from being selected accidentally.
+    """
+    role = validate_role(role)
+    paths = project_paths(record)
+    manifest_path = paths["work"] / "turn_manifest.json"
+    manifest = read_json(manifest_path, [])
+    if not isinstance(manifest, list):
+        raise ValueError("turn_manifest.json must be a list")
+    target = next(
+        (item for item in manifest if isinstance(item, dict) and int(item.get("group", -1)) == group_number),
+        None,
+    )
+    if target is None:
+        raise KeyError(group_number)
+    previous_role = str(target.get("role", "")).strip()
+    if previous_role == role:
+        return {
+            "group": group_number,
+            "role": role,
+            "previous_role": previous_role,
+            "affected_groups": [],
+            "changed": False,
+            "next_step": "This turn already has that character assignment.",
+        }
+
+    raw_indices = target.get("script_indices")
+    if not isinstance(raw_indices, list) or not raw_indices:
+        raise ValueError("This turn has no script row mapping; run build before correcting its character")
+    try:
+        script_indices = {int(index) for index in raw_indices}
+    except (TypeError, ValueError) as error:
+        raise ValueError("This turn has an invalid script row mapping") from error
+    if any(index < 0 for index in script_indices):
+        raise ValueError("This turn has an invalid script row mapping")
+
+    config = read_json(record.config_path, {})
+    input_config = config.get("input", {}) if isinstance(config, dict) else {}
+    script_value = input_config.get("dialogue_script") if isinstance(input_config, dict) else None
+    if not isinstance(script_value, str):
+        raise ValueError("Project config has no dialogue script")
+    script_path = resolve_path(paths["project"], script_value)
+    if not script_path.is_file():
+        raise ValueError(f"Dialogue script is unavailable: {script_path}")
+
+    lines = script_path.read_text(encoding="utf-8-sig").splitlines(keepends=True)
+    found: set[int] = set()
+    row_index = -1
+    for physical_index, raw_line in enumerate(lines):
+        body = raw_line.rstrip("\r\n")
+        stripped = body.strip()
+        if not stripped:
+            continue
+        match = re.fullmatch(r"(\s*)[^:]{1,32}(:\s*.+)", body)
+        if not match:
+            raise ValueError(f"Dialogue script line {physical_index + 1} must be 'ROLE: dialogue'")
+        row_index += 1
+        if row_index not in script_indices:
+            continue
+        ending = raw_line[len(body):]
+        lines[physical_index] = f"{match.group(1)}{role}{match.group(2)}{ending}"
+        found.add(row_index)
+    missing = sorted(script_indices - found)
+    if missing:
+        joined = ", ".join(str(index) for index in missing)
+        raise ValueError(f"Dialogue script no longer contains mapped row(s): {joined}; run build to refresh the mapping")
+    write_text_atomic(script_path, "".join(lines))
+
+    affected: list[int] = []
+    for item in manifest:
+        if not isinstance(item, dict):
+            continue
+        item_indices = item.get("script_indices", [])
+        if not isinstance(item_indices, list):
+            continue
+        try:
+            shares_script_row = bool(script_indices & {int(index) for index in item_indices})
+        except (TypeError, ValueError):
+            continue
+        if not shares_script_row:
+            continue
+        item["role"] = role
+        item["role_override"] = {
+            "from": previous_role,
+            "to": role,
+            "updated_at": utc_now(),
+            "script_indices": sorted(script_indices),
+        }
+        item["render"] = {
+            "candidates": [],
+            "selection": None,
+            "invalidated_reason": f"Character corrected from {previous_role or 'unknown'} to {role}",
+        }
+        group_id = item.get("group")
+        if isinstance(group_id, int):
+            affected.append(group_id)
+    write_json_atomic(manifest_path, manifest)
+
+    review_path = paths["work"] / "translation_review.csv"
+    if review_path.is_file():
+        headers, rows = load_csv(review_path)
+        if "role" not in headers:
+            headers.append("role")
+            for row in rows:
+                row.setdefault("role", "")
+        affected_strings = {str(group) for group in affected}
+        for row in rows:
+            if row.get("group") in affected_strings:
+                row["role"] = role
+        write_csv_atomic(review_path, headers, rows)
+
+    overrides_path = paths["work"] / "candidate_overrides.json"
+    overrides = read_json(overrides_path, {})
+    if isinstance(overrides, dict):
+        for group in affected:
+            overrides.pop(str(group), None)
+        write_json_atomic(overrides_path, overrides)
+
+    return {
+        "group": group_number,
+        "role": role,
+        "previous_role": previous_role,
+        "affected_groups": sorted(affected),
+        "changed": True,
+        "next_step": f"Add or prepare a {role} reference, then render fresh takes for the affected turn(s).",
+    }
+
+
 def role_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
     config = read_json(record.config_path, {})
     paths = project_paths(record)
@@ -726,6 +865,15 @@ class TranslationUpdate(BaseModel):
 
 class CandidateOverride(BaseModel):
     variant: int = Field(ge=1, le=99)
+
+
+class GroupRoleUpdate(BaseModel):
+    role: str = Field(min_length=1, max_length=32)
+
+    @field_validator("role")
+    @classmethod
+    def valid_role(cls, value: str) -> str:
+        return validate_role(value)
 
 
 class PauseMarker(BaseModel):
@@ -1109,6 +1257,15 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
         overrides[str(group_number)] = update.variant
         write_json_atomic(path, overrides)
         return {"group": group_number, "variant": update.variant, "next_step": "Run select for this group to build selected.wav."}
+
+    @app.put("/api/projects/{project_id}/groups/{group_number}/role")
+    async def set_group_role(project_id: str, group_number: int, update: GroupRoleUpdate) -> dict[str, Any]:
+        try:
+            return update_group_role(record_or_404(project_id), group_number, update.role)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown dialogue group") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}/roles")
     async def get_roles(project_id: str) -> list[dict[str, Any]]:
