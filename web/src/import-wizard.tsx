@@ -1,4 +1,4 @@
-import { DragEvent, FormEvent, useState } from 'react'
+import { DragEvent, FormEvent, useEffect, useRef, useState } from 'react'
 
 type AssetKind = 'audio' | 'video' | 'source_srt' | 'target_srt' | 'dialogue_script'
 type Assets = Partial<Record<AssetKind, File>>
@@ -29,12 +29,43 @@ type Props = {
 }
 
 export function ImportWizard({ onImported, onClose }: Props) {
+  const dialogRef = useRef<HTMLElement>(null)
   const [assets, setAssets] = useState<Assets>({})
   const [name, setName] = useState('')
   const [sourceLanguage, setSourceLanguage] = useState('')
   const [targetLanguage, setTargetLanguage] = useState('')
   const [message, setMessage] = useState('Drop the five project assets here, then confirm their roles.')
   const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null
+    const focusables = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href]') ?? []).filter((element) => element.offsetParent !== null)
+    focusables()[0]?.focus()
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const elements = focusables()
+      if (!elements.length) return
+      const first = elements[0]
+      const last = elements[elements.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      previousFocus?.focus()
+    }
+  }, [onClose])
 
   function addFiles(files: FileList | File[]) {
     setAssets((current) => {
@@ -81,7 +112,7 @@ export function ImportWizard({ onImported, onClose }: Props) {
     }
   }
 
-  return <section className="import-overlay" role="dialog" aria-modal="true" aria-label="Import a new dubbing project">
+  return <section className="import-overlay" ref={dialogRef} role="dialog" aria-modal="true" aria-label="Import a new dubbing project">
     <form className="import-wizard" onSubmit={submit}>
       <div className="wizard-heading"><div><p className="eyebrow">NEW LOCAL PROJECT</p><h2>Drop the source assets</h2></div><button type="button" className="secondary" onClick={onClose}>Close</button></div>
       <div className="drop-target" onDragOver={(event) => event.preventDefault()} onDrop={dropped}>

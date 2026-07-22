@@ -57,6 +57,7 @@ ALLOWED_COMMANDS = {
 AUDIO_EXTENSIONS = {".wav", ".wave", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".mkv", ".avi", ".webm"}
 SCRIPT_EXTENSIONS = {".txt", ".md"}
+DELIVERY_EXTENSIONS = {".wav", ".srt"}
 
 
 def utc_now() -> str:
@@ -325,6 +326,37 @@ def project_paths(record: ProjectRecord) -> dict[str, Path]:
     return {"config": record.config_path, "project": base, "work": work, "output": output}
 
 
+def video_delay_seconds(config: dict[str, Any]) -> float:
+    """Return the editor-only picture delay, with malformed config failing safe."""
+    review = config.get("review", {})
+    value = review.get("video_delay_seconds", 0) if isinstance(review, dict) else 0
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(delay, 3) if -5 <= delay <= 5 else 0.0
+
+
+def update_video_delay(record: ProjectRecord, delay_seconds: float) -> dict[str, float]:
+    if not -5 <= delay_seconds <= 5:
+        raise ValueError("Picture delay must be between -5 and 5 seconds")
+    config = read_json(record.config_path, {})
+    if not isinstance(config, dict):
+        raise ValueError("Project config is not an object")
+    review = config.setdefault("review", {})
+    if not isinstance(review, dict):
+        raise ValueError("Project config review is not an object")
+    delay = round(float(delay_seconds), 3)
+    review["video_delay_seconds"] = delay
+    write_json_atomic(record.config_path, config)
+    return {"video_delay_seconds": delay}
+
+
+def translation_qc_report(record: ProjectRecord) -> list[dict[str, str]]:
+    _, rows = load_csv(project_paths(record)["work"] / "translation_qc.csv")
+    return rows
+
+
 def project_snapshot(record: ProjectRecord) -> dict[str, Any]:
     config = read_json(record.config_path, {})
     if not isinstance(config, dict):
@@ -334,11 +366,20 @@ def project_snapshot(record: ProjectRecord) -> dict[str, Any]:
     if not isinstance(manifest, list):
         manifest = []
     input_config = config.get("input", {}) if isinstance(config.get("input"), dict) else {}
+    video_config = config.get("video", {}) if isinstance(config.get("video"), dict) else {}
+    configured_frame_rate = input_config.get("video_frame_rate", video_config.get("frame_rate"))
+    try:
+        frame_rate = float(configured_frame_rate) if configured_frame_rate is not None else None
+    except (TypeError, ValueError):
+        frame_rate = None
+    if frame_rate is not None and not 1 <= frame_rate <= 120:
+        frame_rate = None
     translation_path = paths["work"] / "translation_review.csv"
     selection_path = paths["work"] / "selection.csv"
     approved = sum(item.get("translation_state") == "approved" for item in manifest if isinstance(item, dict))
     rendered = sum(bool(item.get("render", {}).get("candidates")) for item in manifest if isinstance(item, dict))
     selected = sum(bool(item.get("render", {}).get("selection")) for item in manifest if isinstance(item, dict))
+    qa_warning_turns = sum(bool(group.get("qa_flags")) for group in group_summaries(record))
     return {
         "id": record.project_id,
         "name": config.get("project", record.config_path.parent.name),
@@ -346,16 +387,20 @@ def project_snapshot(record: ProjectRecord) -> dict[str, Any]:
         "registered_at": record.registered_at,
         "languages": config.get("languages", {}),
         "has_video": bool(input_config.get("video")),
+        "frame_rate": frame_rate,
+        "video_delay_seconds": video_delay_seconds(config),
         "stage": "ready" if manifest else "initialized",
         "counts": {
             "turns": len(manifest),
             "approved_translations": approved,
             "rendered_turns": rendered,
             "selected_turns": selected,
+            "qa_warning_turns": qa_warning_turns,
         },
         "review_files": {
             "translation_review": translation_path.exists(),
             "selection": selection_path.exists(),
+            "translation_qc": (paths["work"] / "translation_qc.csv").exists(),
             "timing_overrides": (paths["work"] / "timing_overrides.json").exists(),
             "reference_selection": (paths["work"] / "reference_selection.json").exists(),
         },
@@ -493,8 +538,7 @@ def generate_waveform(audio: Path, bins: int) -> dict[str, Any]:
     }
 
 
-def waveform_for_project(cache_dir: Path, record: ProjectRecord, bins: int) -> dict[str, Any]:
-    audio = safe_asset_path(record, "audio")
+def waveform_for_audio(cache_dir: Path, audio: Path, bins: int) -> dict[str, Any]:
     cache_path = waveform_cache_path(cache_dir, audio, bins)
     if cache_path.is_file():
         return read_json(cache_path, {})
@@ -502,6 +546,10 @@ def waveform_for_project(cache_dir: Path, record: ProjectRecord, bins: int) -> d
     data = generate_waveform(audio, bins)
     write_json_atomic(cache_path, data)
     return data
+
+
+def waveform_for_project(cache_dir: Path, record: ProjectRecord, bins: int) -> dict[str, Any]:
+    return waveform_for_audio(cache_dir, safe_asset_path(record, "audio"), bins)
 
 
 def manifest_group(record: ProjectRecord, group_number: int) -> dict[str, Any]:
@@ -858,11 +906,45 @@ def group_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
     manifest = read_json(project_paths(record)["work"] / "turn_manifest.json", [])
     if not isinstance(manifest, list):
         return []
+    config = read_json(record.config_path, {})
+    quality = config.get("quality", {}) if isinstance(config, dict) and isinstance(config.get("quality"), dict) else {}
+    minimum_recall = float(quality.get("minimum_word_recall", 0.82))
+    maximum_overrun = float(quality.get("maximum_overrun_seconds", 0.35))
+    minimum_role_confidence = float(quality.get("minimum_role_confidence", 0.55))
     groups: list[dict[str, Any]] = []
     for item in manifest:
         if not isinstance(item, dict):
             continue
         render = item.get("render", {}) if isinstance(item.get("render"), dict) else {}
+        selection = render.get("selection") if isinstance(render.get("selection"), dict) else None
+        qa_flags: list[str] = []
+        if item.get("translation_state") != "approved":
+            qa_flags.append("translation not approved")
+        if not render.get("candidates"):
+            qa_flags.append("no rendered candidates")
+        if render.get("candidates") and not selection:
+            qa_flags.append("no take selected")
+        if isinstance(item.get("role_confidence"), (float, int)) and float(item["role_confidence"]) < minimum_role_confidence:
+            qa_flags.append("low role confidence")
+        if selection:
+            qa_flags.extend(str(flag) for flag in selection.get("review", []) if str(flag).strip())
+            selected_variant = selection.get("candidate")
+            selected_candidate = next(
+                (
+                    candidate for candidate in selection.get("candidates", [])
+                    if isinstance(candidate, dict) and candidate.get("variant") == selected_variant
+                ),
+                None,
+            )
+            if isinstance(selected_candidate, dict):
+                recall = selected_candidate.get("word_recall")
+                overrun = selected_candidate.get("overrun")
+                if isinstance(recall, (float, int)) and float(recall) < minimum_recall:
+                    qa_flags.append("word recall below threshold")
+                if selected_candidate.get("ending_present") is False:
+                    qa_flags.append("ending missing")
+                if isinstance(overrun, (float, int)) and float(overrun) > maximum_overrun:
+                    qa_flags.append("timing overrun")
         groups.append(
             {
                 "group": item.get("group"),
@@ -877,7 +959,8 @@ def group_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
                 "timing_state": item.get("timing_state"),
                 "role_confidence": item.get("role_confidence"),
                 "candidate_count": len(render.get("candidates", [])),
-                "selection": render.get("selection"),
+                "selection": selection,
+                "qa_flags": sorted(set(qa_flags)),
             }
         )
     return groups
@@ -928,6 +1011,10 @@ class PauseMarker(BaseModel):
 
 class PauseUpdate(BaseModel):
     markers: list[PauseMarker] = Field(default_factory=list, max_length=12)
+
+
+class VideoDelayUpdate(BaseModel):
+    video_delay_seconds: float = Field(ge=-5, le=5)
 
 
 class JobRequest(BaseModel):
@@ -1008,6 +1095,11 @@ class PipelineJobQueue:
             raise ValueError(f"Unsupported pipeline command: {command}")
         if command in {"render", "select"} and not request.groups:
             raise ValueError(f"{command} requires at least one targeted group")
+        if command == "build" and (project_paths(project)["work"] / "turn_manifest.json").exists() and not request.confirm:
+            raise ValueError(
+                "build would replace existing review metadata; import a new project instead, "
+                "or explicitly confirm this destructive operation"
+            )
         if command in {"assemble", "validate"} and not request.confirm:
             raise ValueError(f"{command} requires explicit confirmation")
         args = [str(self._interpreter(command)), str(PIPELINE_PATH), command, "--config", str(project.config_path)]
@@ -1140,6 +1232,26 @@ def safe_asset_path(record: ProjectRecord, asset: str) -> Path:
     return path
 
 
+def delivery_assets(record: ProjectRecord) -> list[dict[str, Any]]:
+    """Return only final, project-local delivery files suitable for download."""
+    output = project_paths(record)["output"].resolve()
+    if not output.is_dir():
+        return []
+    return [
+        {"name": path.name, "size": path.stat().st_size, "kind": "audio" if path.suffix.lower() == ".wav" else "subtitle"}
+        for path in sorted(output.iterdir())
+        if path.is_file() and path.suffix.lower() in DELIVERY_EXTENSIONS
+    ]
+
+
+def delivery_asset(record: ProjectRecord, name: str) -> Path:
+    output = project_paths(record)["output"].resolve()
+    candidate = (output / name).resolve()
+    if candidate.parent != output or candidate.suffix.lower() not in DELIVERY_EXTENSIONS or not candidate.is_file():
+        raise FileNotFoundError(name)
+    return candidate
+
+
 def create_app(
     *,
     state_dir: Path | None = None,
@@ -1264,6 +1376,13 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
     async def get_groups(project_id: str) -> list[dict[str, Any]]:
         return group_summaries(record_or_404(project_id))
 
+    @app.put("/api/projects/{project_id}/video-delay")
+    async def put_video_delay(project_id: str, update: VideoDelayUpdate) -> dict[str, float]:
+        try:
+            return update_video_delay(record_or_404(project_id), update.video_delay_seconds)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.get("/api/projects/{project_id}/groups/{group_number}/candidates")
     async def get_candidates(project_id: str, group_number: int) -> dict[str, Any]:
         try:
@@ -1277,6 +1396,15 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
             return FileResponse(candidate_audio(record_or_404(project_id), group_number, asset))
         except (KeyError, FileNotFoundError) as error:
             raise HTTPException(status_code=404, detail="Candidate audio is unavailable") from error
+
+    @app.get("/api/projects/{project_id}/groups/{group_number}/audio/{asset}/waveform")
+    async def get_candidate_waveform(project_id: str, group_number: int, asset: str, bins: int = Query(default=360, ge=64, le=2_400)) -> dict[str, Any]:
+        try:
+            return waveform_for_audio(waveform_cache, candidate_audio(record_or_404(project_id), group_number, asset), bins)
+        except (KeyError, FileNotFoundError) as error:
+            raise HTTPException(status_code=404, detail="Candidate audio is unavailable") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.put("/api/projects/{project_id}/groups/{group_number}/candidate-override")
     async def set_candidate_override(project_id: str, group_number: int, update: CandidateOverride) -> dict[str, Any]:
@@ -1353,6 +1481,15 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
             raise HTTPException(status_code=422, detail=str(error)) from error
         return {"headers": headers, "rows": rows}
 
+    @app.get("/api/projects/{project_id}/translation-qc")
+    async def get_translation_qc(project_id: str) -> dict[str, Any]:
+        try:
+            return {"rows": translation_qc_report(record_or_404(project_id))}
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=409, detail="Run translation validation to create the QC report") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.put("/api/projects/{project_id}/translation-review/{group}")
     async def update_translation_review(project_id: str, group: int, update: TranslationUpdate) -> dict[str, Any]:
         record = record_or_404(project_id)
@@ -1388,6 +1525,17 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
         # Omit a download filename so the browser can use range requests for
         # inline audio/video playback in the later review interface.
         return FileResponse(path)
+
+    @app.get("/api/projects/{project_id}/delivery-assets")
+    async def get_delivery_assets(project_id: str) -> list[dict[str, Any]]:
+        return delivery_assets(record_or_404(project_id))
+
+    @app.get("/api/projects/{project_id}/delivery-assets/{name}")
+    async def get_delivery_asset(project_id: str, name: str) -> FileResponse:
+        try:
+            return FileResponse(delivery_asset(record_or_404(project_id), name), filename=name)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Delivery file is unavailable") from error
 
     @app.get("/api/projects/{project_id}/waveform")
     async def get_waveform(project_id: str, bins: int = Query(default=2400, ge=128, le=12_000)) -> dict[str, Any]:

@@ -19,13 +19,19 @@ from local_ui import (
     candidate_audio,
     candidate_summaries,
     create_imported_project,
+    delivery_asset,
+    delivery_assets,
     generate_waveform,
+    group_summaries,
     load_csv,
     project_snapshot,
     project_paths,
     role_summaries,
+    translation_qc_report,
+    update_video_delay,
     update_group_role,
     update_pause_overrides,
+    waveform_for_audio,
     write_csv_atomic,
 )
 from reusable_pipeline import clean_generation, default_config, render_text_with_natural_pauses, validate_translation_text
@@ -175,6 +181,7 @@ class LocalUiTests(unittest.TestCase):
             record = store.register(project)
             self.assertEqual(candidate_summaries(record, 1)["candidates"][0]["variant"], 1)
             self.assertEqual(candidate_audio(record, 1, "candidate-1"), candidate_path)
+            self.assertEqual(waveform_for_audio(root / "waveforms", candidate_path, 64)["duration"], 0.1)
             summary = update_pause_overrides(record, 1, [PauseMarker(after_word=1, duration_ms=350)])
             rendered, markers = render_text_with_natural_pauses(project / "work", 1, "Hello there")
             self.assertEqual(rendered, "Hello... there")
@@ -240,7 +247,76 @@ class LocalUiTests(unittest.TestCase):
             self.assertEqual(saved_rows[0]["lip_sync_text"], "Hi there")
             self.assertEqual(saved_rows[0]["approved"], "yes")
 
-    def test_job_command_requires_targeted_render_and_confirmed_assembly(self) -> None:
+    def test_translation_qc_report_exposes_problem_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            (project / "work" / "translation_qc.csv").write_text(
+                "group,role,word_budget,word_count,translation_state,issues,text\n"
+                "1,PUL,3,5,approved,over word-budget guide,Hello there friend now\n",
+                encoding="utf-8",
+            )
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+            report = translation_qc_report(record)
+
+            self.assertEqual(report[0]["group"], "1")
+            self.assertEqual(report[0]["issues"], "over word-budget guide")
+
+    def test_project_snapshot_exposes_frame_rate_and_qa_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            config_path = project / "pipeline.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["video"] = {"frame_rate": 25}
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            manifest_path = project / "work" / "turn_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest[0]["render"] = {
+                "candidates": [{"variant": 1}],
+                "selection": {
+                    "candidate": 1,
+                    "review": ["word-integrity review"],
+                    "candidates": [{"variant": 1, "word_recall": 0.6, "ending_present": False, "overrun": 0.6}],
+                },
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+
+            snapshot = project_snapshot(record)
+            flags = group_summaries(record)[0]["qa_flags"]
+
+            self.assertEqual(snapshot["frame_rate"], 25.0)
+            self.assertEqual(snapshot["video_delay_seconds"], 0.0)
+            self.assertEqual(update_video_delay(record, -0.125)["video_delay_seconds"], -0.125)
+            self.assertEqual(project_snapshot(record)["video_delay_seconds"], -0.125)
+            self.assertEqual(snapshot["counts"]["qa_warning_turns"], 1)
+            self.assertIn("word-integrity review", flags)
+            self.assertIn("word recall below threshold", flags)
+            self.assertIn("ending missing", flags)
+            self.assertIn("timing overrun", flags)
+
+    def test_delivery_assets_are_project_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            audio = project / "output" / "dialogue_en.wav"
+            subtitle = project / "output" / "dialogue_en.srt"
+            ignored = project / "output" / "notes.txt"
+            audio.write_bytes(b"wav")
+            subtitle.write_text("subtitle", encoding="utf-8")
+            ignored.write_text("not delivery", encoding="utf-8")
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+
+            self.assertEqual([item["name"] for item in delivery_assets(record)], ["dialogue_en.srt", "dialogue_en.wav"])
+            self.assertEqual(delivery_asset(record, "dialogue_en.wav"), audio)
+            with self.assertRaises(FileNotFoundError):
+                delivery_asset(record, "../pipeline.json")
+
+    def test_job_command_requires_targeted_render_and_confirmed_destructive_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project = make_project(root)
@@ -249,5 +325,8 @@ class LocalUiTests(unittest.TestCase):
             queue = PipelineJobQueue(store, root / "state")
             with self.assertRaisesRegex(ValueError, "targeted group"):
                 queue._command(record, JobRequest(command="render"))
+            with self.assertRaisesRegex(ValueError, "replace existing review metadata"):
+                queue._command(record, JobRequest(command="build"))
+            self.assertIn("build", queue._command(record, JobRequest(command="build", confirm=True)))
             with self.assertRaisesRegex(ValueError, "explicit confirmation"):
                 queue._command(record, JobRequest(command="assemble"))
