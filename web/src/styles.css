@@ -35,10 +35,10 @@ h3 { color: #9db0c2; font-size: .72rem; letter-spacing: .09em; text-transform: u
 .group-list { border-right: 1px solid #213a4d; overflow: auto; }
 .panel-title { padding: .9rem; border-bottom: 1px solid #213a4d; }
 .panel-title span { color: #8fa8b9; font-size: .75rem; }
-.group-row { display: grid; grid-template-columns: 2rem .55rem 1fr 1rem; width: 100%; padding: .72rem .8rem; text-align: left; border-radius: 0; color: #dbe7ef; background: transparent; border-bottom: 1px solid #172a3a; }
+.group-row { display: grid; grid-template-columns: 2rem .35rem 1fr 1rem; width: 100%; padding: .72rem .8rem; text-align: left; border-radius: 0; color: #dbe7ef; background: transparent; border-bottom: 1px solid #172a3a; }
 .group-row:hover, .group-row.selected { background: #1a3448; }
 .group-number { color: #7590a4; font-size: .74rem; font-variant-numeric: tabular-nums; }
-.role-dot { width: .42rem; height: .42rem; align-self: center; border-radius: 50%; }
+.role-ribbon { width: .28rem; align-self: stretch; margin: -.72rem 0; box-shadow: inset -1px 0 rgba(255, 255, 255, .32); }
 .group-main { display: grid; gap: .18rem; }.group-main b { font-size: .76rem; }.group-main small { color: #8fa8b9; font-size: .69rem; }
 .state { align-self: center; color: #f0c36b; }.state-approved { color: #5bd9b5; }
 
