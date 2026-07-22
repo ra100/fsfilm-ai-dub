@@ -11,6 +11,8 @@ import csv
 import hashlib
 import json
 import os
+import re
+import shutil
 import sqlite3
 import sys
 import uuid
@@ -20,17 +22,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+import numpy as np
+import soundfile as sf
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+from reusable_pipeline import default_config
+
 
 REPO_ROOT = Path(__file__).resolve().parent
+PROJECTS_ROOT = REPO_ROOT / "projects"
 PIPELINE_PATH = REPO_ROOT / "reusable_pipeline.py"
 DEFAULT_STATE_DIR = REPO_ROOT / ".local-ui"
 WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
+WAVEFORM_CACHE_VERSION = 1
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
 ALLOWED_COMMANDS = {
     "preflight",
@@ -46,6 +54,9 @@ ALLOWED_COMMANDS = {
     "validate",
     "status",
 }
+AUDIO_EXTENSIONS = {".wav", ".wave", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+VIDEO_EXTENSIONS = {".mov", ".mp4", ".mkv", ".avi", ".webm"}
+SCRIPT_EXTENSIONS = {".txt", ".md"}
 
 
 def utc_now() -> str:
@@ -87,6 +98,35 @@ def write_csv_atomic(path: Path, fieldnames: list[str], rows: list[dict[str, str
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(path)
+
+
+def write_json_atomic(path: Path, value: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def project_slug(name: str) -> str:
+    value = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-_")
+    if not value or len(value) > 64:
+        raise ValueError("Project name must yield a 1–64 character lowercase folder name")
+    return value
+
+
+def upload_extension(upload: UploadFile, allowed: set[str], label: str) -> str:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ValueError(f"{label} must use one of: {choices}")
+    return suffix
+
+
+async def save_upload(upload: UploadFile, path: Path) -> None:
+    """Persist a browser-dropped file without exposing its original path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as handle:
+        while chunk := await upload.read(1024 * 1024):
+            handle.write(chunk)
 
 
 @dataclass(frozen=True)
@@ -316,6 +356,328 @@ def project_snapshot(record: ProjectRecord) -> dict[str, Any]:
     }
 
 
+async def create_imported_project(
+    store: ProjectStore,
+    *,
+    display_name: str,
+    source_language: str,
+    target_language: str,
+    audio: UploadFile,
+    source_srt: UploadFile,
+    target_srt: UploadFile,
+    dialogue_script: UploadFile,
+    video: UploadFile | None,
+) -> ProjectRecord:
+    """Create an isolated project from browser uploads, never from browser paths."""
+    name = display_name.strip()
+    if not name or len(name) > 160:
+        raise ValueError("Project name must be 1–160 characters")
+    if not re.fullmatch(r"[a-z]{2,8}", source_language) or not re.fullmatch(r"[a-z]{2,8}", target_language):
+        raise ValueError("Language codes must be 2–8 lowercase letters")
+    if not is_within(PROJECTS_ROOT, store.allowed_roots):
+        raise PermissionError(f"Imported projects require an allowed root containing {PROJECTS_ROOT}")
+    project = PROJECTS_ROOT / project_slug(name)
+    if project.exists():
+        raise FileExistsError(f"A project already exists at {project}; choose another name")
+    audio_suffix = upload_extension(audio, AUDIO_EXTENSIONS, "Dialogue audio")
+    source_suffix = upload_extension(source_srt, {".srt"}, "Source subtitle")
+    target_suffix = upload_extension(target_srt, {".srt"}, "Target subtitle")
+    script_suffix = upload_extension(dialogue_script, SCRIPT_EXTENSIONS, "Dialogue script")
+    video_suffix = upload_extension(video, VIDEO_EXTENSIONS, "Video") if video else None
+    try:
+        project.mkdir(parents=True)
+        inputs = project / "inputs"
+        audio_path = inputs / f"dialogue{audio_suffix}"
+        source_path = inputs / f"source{source_suffix}"
+        target_path = inputs / f"target{target_suffix}"
+        script_path = inputs / f"dialogue_script{script_suffix}"
+        await save_upload(audio, audio_path)
+        await save_upload(source_srt, source_path)
+        await save_upload(target_srt, target_path)
+        await save_upload(dialogue_script, script_path)
+        video_path: Path | None = None
+        if video and video_suffix:
+            video_path = inputs / f"picture{video_suffix}"
+            await save_upload(video, video_path)
+        for folder in ("work", "output", "notes"):
+            (project / folder).mkdir(exist_ok=True)
+        config = default_config(
+            project,
+            name,
+            audio_path,
+            source_path,
+            target_path,
+            script_path,
+            source_language,
+            target_language,
+            video=video_path,
+        )
+        write_json_atomic(project / "pipeline.json", config)
+        (project / "notes" / "README.txt").write_text(
+            "Imported through the local UI. Inputs are intentionally ignored by Git.\n"
+            "Use work/ for reviewable changes and output/ for generated delivery artifacts.\n",
+            encoding="utf-8",
+        )
+        return store.register(project)
+    except Exception:
+        if project.exists():
+            shutil.rmtree(project)
+        raise
+
+
+async def attach_video(record: ProjectRecord, upload: UploadFile) -> dict[str, Any]:
+    suffix = upload_extension(upload, VIDEO_EXTENSIONS, "Video")
+    paths = project_paths(record)
+    inputs = paths["project"] / "inputs"
+    # A new immutable filename retains the prior picture asset if the editor
+    # later needs to revert manually.
+    destination = inputs / f"picture_{uuid.uuid4().hex[:8]}{suffix}"
+    await save_upload(upload, destination)
+    config = read_json(record.config_path, {})
+    if not isinstance(config, dict):
+        raise ValueError("Project config is not an object")
+    input_config = config.setdefault("input", {})
+    if not isinstance(input_config, dict):
+        raise ValueError("Project config input is not an object")
+    input_config["video"] = destination.relative_to(paths["project"]).as_posix()
+    write_json_atomic(record.config_path, config)
+    return project_snapshot(record)
+
+
+def waveform_cache_path(cache_dir: Path, audio: Path, bins: int) -> Path:
+    stat = audio.stat()
+    identity = f"{WAVEFORM_CACHE_VERSION}:{audio}:{stat.st_size}:{stat.st_mtime_ns}:{bins}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.json"
+
+
+def generate_waveform(audio: Path, bins: int) -> dict[str, Any]:
+    """Return min/max PCM peaks without loading a feature-length track at once."""
+    try:
+        with sf.SoundFile(audio) as source:
+            frames = int(source.frames)
+            sample_rate = int(source.samplerate)
+            if frames <= 0 or sample_rate <= 0:
+                raise ValueError("Audio has no samples")
+            actual_bins = min(max(64, bins), frames)
+            samples_per_bin = max(1, (frames + actual_bins - 1) // actual_bins)
+            effective_bins = (frames + samples_per_bin - 1) // samples_per_bin
+            minimum = np.full(effective_bins, np.inf, dtype=np.float32)
+            maximum = np.full(effective_bins, -np.inf, dtype=np.float32)
+            offset = 0
+            while True:
+                block = source.read(65_536, dtype="float32", always_2d=True)
+                if len(block) == 0:
+                    break
+                mono = block.mean(axis=1)
+                indices = ((offset + np.arange(len(mono))) // samples_per_bin).astype(np.intp)
+                np.minimum.at(minimum, indices, mono)
+                np.maximum.at(maximum, indices, mono)
+                offset += len(mono)
+    except RuntimeError as error:
+        raise ValueError(f"Cannot decode waveform audio {audio.name}: {error}") from error
+    minimum[~np.isfinite(minimum)] = 0.0
+    maximum[~np.isfinite(maximum)] = 0.0
+    return {
+        "duration": round(frames / sample_rate, 6),
+        "sample_rate": sample_rate,
+        "bins": effective_bins,
+        "min": [round(float(value), 4) for value in minimum],
+        "max": [round(float(value), 4) for value in maximum],
+    }
+
+
+def waveform_for_project(cache_dir: Path, record: ProjectRecord, bins: int) -> dict[str, Any]:
+    audio = safe_asset_path(record, "audio")
+    cache_path = waveform_cache_path(cache_dir, audio, bins)
+    if cache_path.is_file():
+        return read_json(cache_path, {})
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    data = generate_waveform(audio, bins)
+    write_json_atomic(cache_path, data)
+    return data
+
+
+def manifest_group(record: ProjectRecord, group_number: int) -> dict[str, Any]:
+    manifest = read_json(project_paths(record)["work"] / "turn_manifest.json", [])
+    if not isinstance(manifest, list):
+        raise KeyError(group_number)
+    group = next((item for item in manifest if isinstance(item, dict) and int(item.get("group", -1)) == group_number), None)
+    if group is None:
+        raise KeyError(group_number)
+    return group
+
+
+def render_asset_path(record: ProjectRecord, relative_path: str) -> Path:
+    paths = project_paths(record)
+    path = resolve_path(paths["project"], relative_path)
+    render_root = (paths["work"] / "renders").resolve()
+    if not path.is_file() or not path.is_relative_to(render_root):
+        raise FileNotFoundError(relative_path)
+    return path
+
+
+def candidate_summaries(record: ProjectRecord, group_number: int) -> dict[str, Any]:
+    group = manifest_group(record, group_number)
+    render = group.get("render", {}) if isinstance(group.get("render"), dict) else {}
+    selection = render.get("selection") if isinstance(render.get("selection"), dict) else {}
+    analyzed = selection.get("candidates", []) if isinstance(selection, dict) else []
+    analyzed_by_variant = {int(item["variant"]): item for item in analyzed if isinstance(item, dict) and "variant" in item}
+    candidates = []
+    for candidate in render.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        variant = int(candidate["variant"])
+        detail = analyzed_by_variant.get(variant, {})
+        candidates.append(
+            {
+                "variant": variant,
+                "duration": detail.get("duration", candidate.get("duration")),
+                "seed": candidate.get("seed"),
+                "word_recall": detail.get("word_recall"),
+                "ending_present": detail.get("ending_present"),
+                "available_duration": detail.get("available_duration"),
+                "overrun": detail.get("overrun"),
+                "score": detail.get("score"),
+                "transcript": detail.get("transcript"),
+                "selected": bool(selection and int(selection.get("candidate", -1)) == variant),
+            }
+        )
+    return {
+        "group": group_number,
+        "role": group.get("role"),
+        "text": group.get("lip_sync_text"),
+        "candidates": candidates,
+        "selection": selection or None,
+    }
+
+
+def candidate_audio(record: ProjectRecord, group_number: int, asset: str) -> Path:
+    group = manifest_group(record, group_number)
+    render = group.get("render", {}) if isinstance(group.get("render"), dict) else {}
+    if asset == "selected":
+        selection = render.get("selection")
+        if not isinstance(selection, dict) or not isinstance(selection.get("path"), str):
+            raise FileNotFoundError(asset)
+        return render_asset_path(record, selection["path"])
+    match = re.fullmatch(r"candidate-(\d{1,2})", asset)
+    if not match:
+        raise FileNotFoundError(asset)
+    wanted = int(match.group(1))
+    candidate = next((item for item in render.get("candidates", []) if isinstance(item, dict) and int(item.get("variant", -1)) == wanted), None)
+    if not candidate or not isinstance(candidate.get("path"), str):
+        raise FileNotFoundError(asset)
+    return render_asset_path(record, candidate["path"])
+
+
+def validate_role(role: str) -> str:
+    value = role.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]{1,32}", value):
+        raise ValueError("Role must be 1–32 uppercase letters, digits, or underscores")
+    return value
+
+
+def role_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
+    config = read_json(record.config_path, {})
+    paths = project_paths(record)
+    configured = config.get("roles", {}) if isinstance(config, dict) and isinstance(config.get("roles"), dict) else {}
+    manifest = read_json(paths["work"] / "turn_manifest.json", [])
+    roles = set(configured)
+    roles.update(item.get("role") for item in manifest if isinstance(item, dict) and item.get("role"))
+    results = []
+    for role in sorted(roles):
+        entry = configured.get(role, {}) if isinstance(configured.get(role), dict) else {}
+        generated = paths["work"] / "references" / f"{role}.wav"
+        reference = entry.get("reference_audio")
+        emotion = entry.get("emotion_audio")
+        results.append(
+            {
+                "role": role,
+                "configured_reference": bool(reference),
+                "configured_emotion": bool(emotion),
+                "generated_reference": generated.is_file(),
+            }
+        )
+    return results
+
+
+async def attach_role_audio(record: ProjectRecord, role: str, kind: str, upload: UploadFile) -> dict[str, Any]:
+    role = validate_role(role)
+    if kind not in {"reference", "emotion"}:
+        raise ValueError("Audio kind must be reference or emotion")
+    suffix = upload_extension(upload, AUDIO_EXTENSIONS, "Role audio")
+    paths = project_paths(record)
+    destination = paths["project"] / "inputs" / "references" / f"{role.lower()}_{kind}_{uuid.uuid4().hex[:8]}{suffix}"
+    await save_upload(upload, destination)
+    config = read_json(record.config_path, {})
+    if not isinstance(config, dict):
+        raise ValueError("Project config is not an object")
+    roles = config.setdefault("roles", {})
+    if not isinstance(roles, dict):
+        raise ValueError("Project roles are not an object")
+    entry = roles.setdefault(role, {})
+    if not isinstance(entry, dict):
+        raise ValueError(f"Project role {role} is not an object")
+    entry["reference_audio" if kind == "reference" else "emotion_audio"] = destination.relative_to(paths["project"]).as_posix()
+    write_json_atomic(record.config_path, config)
+    return {"role": role, "kind": kind, "roles": role_summaries(record)}
+
+
+def role_audio(record: ProjectRecord, role: str, kind: str) -> Path:
+    role = validate_role(role)
+    paths = project_paths(record)
+    config = read_json(record.config_path, {})
+    entry = config.get("roles", {}).get(role, {}) if isinstance(config, dict) else {}
+    if kind == "reference":
+        generated = paths["work"] / "references" / f"{role}.wav"
+        if generated.is_file():
+            return generated
+        key = "reference_audio"
+    elif kind == "emotion":
+        key = "emotion_audio"
+    else:
+        raise FileNotFoundError(kind)
+    source = entry.get(key) if isinstance(entry, dict) else None
+    if not isinstance(source, str):
+        raise FileNotFoundError(kind)
+    path = resolve_path(paths["project"], source)
+    if not path.is_file():
+        raise FileNotFoundError(kind)
+    return path
+
+
+def pause_overrides(record: ProjectRecord) -> dict[str, list[dict[str, Any]]]:
+    path = project_paths(record)["work"] / "pause_overrides.json"
+    value = read_json(path, {})
+    if not isinstance(value, dict):
+        raise ValueError("pause_overrides.json must be an object")
+    return value
+
+
+def update_pause_overrides(record: ProjectRecord, group_number: int, markers: list[PauseMarker]) -> dict[str, Any]:
+    group = manifest_group(record, group_number)
+    words = re.findall(r"\b[\w']+\b", str(group.get("lip_sync_text", "")))
+    if any(marker.after_word > len(words) for marker in markers):
+        raise ValueError(f"Pause word position exceeds the {len(words)} words in group {group_number}")
+    overrides = pause_overrides(record)
+    overrides[str(group_number)] = [marker.model_dump() for marker in sorted(markers, key=lambda item: item.after_word)]
+    write_json_atomic(project_paths(record)["work"] / "pause_overrides.json", overrides)
+    config = read_json(record.config_path, {})
+    translation = config.get("translation", {}) if isinstance(config, dict) and isinstance(config.get("translation"), dict) else {}
+    words_per_second = float(translation.get("words_per_second", 2.35))
+    speech_seconds = len(words) / max(0.1, words_per_second)
+    pause_seconds = sum(marker.duration_ms for marker in markers) / 1000.0
+    available = float(group.get("source_span", float(group.get("source_end", 0)) - float(group.get("source_start", 0))))
+    return {
+        "group": group_number,
+        "markers": overrides[str(group_number)],
+        "estimated_speech_seconds": round(speech_seconds, 3),
+        "requested_pause_seconds": round(pause_seconds, 3),
+        "available_seconds": round(available, 3),
+        "remaining_seconds": round(available - speech_seconds - pause_seconds, 3),
+    }
+
+
 def group_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
     manifest = read_json(project_paths(record)["work"] / "turn_manifest.json", [])
     if not isinstance(manifest, list):
@@ -360,6 +722,27 @@ class TranslationUpdate(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("lip_sync_text must not be blank")
         return value.strip() if value is not None else None
+
+
+class CandidateOverride(BaseModel):
+    variant: int = Field(ge=1, le=99)
+
+
+class PauseMarker(BaseModel):
+    after_word: int = Field(ge=1, le=500)
+    duration_ms: int = Field(ge=50, le=5000)
+    mode: str = "natural"
+
+    @field_validator("mode")
+    @classmethod
+    def known_mode(cls, value: str) -> str:
+        if value not in {"natural", "hard"}:
+            raise ValueError("Pause mode must be natural or hard")
+        return value
+
+
+class PauseUpdate(BaseModel):
+    markers: list[PauseMarker] = Field(default_factory=list, max_length=12)
 
 
 class JobRequest(BaseModel):
@@ -581,10 +964,11 @@ def create_app(
     state = (state_dir or DEFAULT_STATE_DIR).resolve()
     roots = tuple(allowed_roots or (REPO_ROOT / "projects",))
     projects = ProjectStore(state, roots)
-    projects.discover(REPO_ROOT / "projects")
+    projects.discover(PROJECTS_ROOT)
     for project in initial_projects:
         projects.register(project)
     jobs = PipelineJobQueue(projects, state)
+    waveform_cache = state / "waveforms"
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -649,6 +1033,44 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
+    @app.post("/api/projects/import", status_code=201)
+    async def import_project(
+        project_name: str = Form(...),
+        source_language: str = Form("cs"),
+        target_language: str = Form("en"),
+        audio: UploadFile = File(...),
+        source_srt: UploadFile = File(...),
+        target_srt: UploadFile = File(...),
+        dialogue_script: UploadFile = File(...),
+        video: UploadFile | None = File(default=None),
+    ) -> dict[str, Any]:
+        try:
+            record = await create_imported_project(
+                projects,
+                display_name=project_name,
+                source_language=source_language.strip().lower(),
+                target_language=target_language.strip().lower(),
+                audio=audio,
+                source_srt=source_srt,
+                target_srt=target_srt,
+                dialogue_script=dialogue_script,
+                video=video,
+            )
+            return project_snapshot(record)
+        except FileExistsError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.post("/api/projects/{project_id}/video")
+    async def upload_video(project_id: str, video: UploadFile = File(...)) -> dict[str, Any]:
+        try:
+            return await attach_video(record_or_404(project_id), video)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.get("/api/projects/{project_id}")
     async def get_project(project_id: str) -> dict[str, Any]:
         return project_snapshot(record_or_404(project_id))
@@ -656,6 +1078,75 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
     @app.get("/api/projects/{project_id}/groups")
     async def get_groups(project_id: str) -> list[dict[str, Any]]:
         return group_summaries(record_or_404(project_id))
+
+    @app.get("/api/projects/{project_id}/groups/{group_number}/candidates")
+    async def get_candidates(project_id: str, group_number: int) -> dict[str, Any]:
+        try:
+            return candidate_summaries(record_or_404(project_id), group_number)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown dialogue group") from error
+
+    @app.get("/api/projects/{project_id}/groups/{group_number}/audio/{asset}")
+    async def get_candidate_audio(project_id: str, group_number: int, asset: str) -> FileResponse:
+        try:
+            return FileResponse(candidate_audio(record_or_404(project_id), group_number, asset))
+        except (KeyError, FileNotFoundError) as error:
+            raise HTTPException(status_code=404, detail="Candidate audio is unavailable") from error
+
+    @app.put("/api/projects/{project_id}/groups/{group_number}/candidate-override")
+    async def set_candidate_override(project_id: str, group_number: int, update: CandidateOverride) -> dict[str, Any]:
+        record = record_or_404(project_id)
+        try:
+            candidates = candidate_summaries(record, group_number)["candidates"]
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown dialogue group") from error
+        if update.variant not in {item["variant"] for item in candidates}:
+            raise HTTPException(status_code=422, detail="Requested candidate does not exist for this group")
+        path = project_paths(record)["work"] / "candidate_overrides.json"
+        overrides = read_json(path, {})
+        if not isinstance(overrides, dict):
+            raise HTTPException(status_code=422, detail="candidate_overrides.json must be an object")
+        overrides[str(group_number)] = update.variant
+        write_json_atomic(path, overrides)
+        return {"group": group_number, "variant": update.variant, "next_step": "Run select for this group to build selected.wav."}
+
+    @app.get("/api/projects/{project_id}/roles")
+    async def get_roles(project_id: str) -> list[dict[str, Any]]:
+        return role_summaries(record_or_404(project_id))
+
+    @app.get("/api/projects/{project_id}/roles/{role}/audio/{kind}")
+    async def get_role_audio(project_id: str, role: str, kind: str) -> FileResponse:
+        try:
+            return FileResponse(role_audio(record_or_404(project_id), role, kind))
+        except (ValueError, FileNotFoundError) as error:
+            raise HTTPException(status_code=404, detail="Role audio is unavailable") from error
+
+    @app.post("/api/projects/{project_id}/roles/{role}/audio/{kind}")
+    async def upload_role_audio(project_id: str, role: str, kind: str, audio: UploadFile = File(...)) -> dict[str, Any]:
+        try:
+            return await attach_role_audio(record_or_404(project_id), role, kind, audio)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/projects/{project_id}/groups/{group_number}/pauses")
+    async def get_pauses(project_id: str, group_number: int) -> dict[str, Any]:
+        record = record_or_404(project_id)
+        try:
+            manifest_group(record, group_number)
+            return {"group": group_number, "markers": pause_overrides(record).get(str(group_number), [])}
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown dialogue group") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.put("/api/projects/{project_id}/groups/{group_number}/pauses")
+    async def put_pauses(project_id: str, group_number: int, update: PauseUpdate) -> dict[str, Any]:
+        try:
+            return update_pause_overrides(record_or_404(project_id), group_number, update.markers)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown dialogue group") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}/translation-review")
     async def get_translation_review(project_id: str) -> dict[str, Any]:
@@ -703,6 +1194,15 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
         # Omit a download filename so the browser can use range requests for
         # inline audio/video playback in the later review interface.
         return FileResponse(path)
+
+    @app.get("/api/projects/{project_id}/waveform")
+    async def get_waveform(project_id: str, bins: int = Query(default=2400, ge=128, le=12_000)) -> dict[str, Any]:
+        try:
+            return waveform_for_project(waveform_cache, record_or_404(project_id), bins)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Registered dialogue audio is unavailable") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/projects/{project_id}/jobs")
     async def list_jobs(project_id: str, limit: int = Query(default=50, ge=1, le=200)) -> list[dict[str, Any]]:

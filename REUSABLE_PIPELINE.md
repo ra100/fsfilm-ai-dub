@@ -27,6 +27,7 @@ line so the translation or reference can be fixed.
 For a new short, provide:
 
 - a mono or stereo dialogue/final-mix WAV;
+- optionally, a picture reference video for local UI lip-sync review;
 - source-language SRT (Czech in the normal use case);
 - a legacy target-language SRT. Its wording is a semantic starting point only;
 - a source-language dialogue script where every spoken line is `ROLE: text`.
@@ -67,6 +68,7 @@ ai_dub/.venv/bin/python ai_dub/reusable_pipeline.py init \
   --project ai_dub/projects/my_short_en \
   --name my_short_en \
   --audio /path/to/dialogue-or-final-mix.wav \
+  --video /path/to/picture-reference.mov \
   --source-srt /path/to/source.cs.srt \
   --target-srt /path/to/legacy.en.srt \
   --dialogue-script /path/to/dialogy.txt \

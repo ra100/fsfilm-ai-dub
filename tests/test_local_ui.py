@@ -1,11 +1,49 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from local_ui import JobRequest, PipelineJobQueue, ProjectStore, load_csv, project_snapshot, project_paths, write_csv_atomic
+import numpy as np
+import soundfile as sf
+
+import local_ui
+from local_ui import (
+    JobRequest,
+    PauseMarker,
+    PipelineJobQueue,
+    ProjectStore,
+    candidate_audio,
+    candidate_summaries,
+    create_imported_project,
+    generate_waveform,
+    load_csv,
+    project_snapshot,
+    project_paths,
+    update_pause_overrides,
+    write_csv_atomic,
+)
+from reusable_pipeline import render_text_with_natural_pauses
+
+
+class FakeUpload:
+    """Small async upload double; Starlette's real UploadFile needs an ASGI portal."""
+
+    def __init__(self, filename: str, data: bytes) -> None:
+        self.filename = filename
+        self.data = data
+        self.offset = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if self.offset >= len(self.data):
+            return b""
+        end = len(self.data) if size < 0 else self.offset + size
+        chunk = self.data[self.offset:end]
+        self.offset += len(chunk)
+        return chunk
 
 
 def make_project(root: Path) -> Path:
@@ -49,6 +87,74 @@ def make_project(root: Path) -> Path:
 
 
 class LocalUiTests(unittest.TestCase):
+    def test_import_creates_portable_input_video_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            projects_root = root / "projects"
+            projects_root.mkdir()
+            audio = io.BytesIO()
+            sf.write(audio, np.zeros(800, dtype=np.float32), 8000, format="WAV")
+            previous_root = local_ui.PROJECTS_ROOT
+            local_ui.PROJECTS_ROOT = projects_root
+            try:
+                store = ProjectStore(root / "state", [projects_root])
+                record = asyncio.run(
+                    create_imported_project(
+                        store,
+                        display_name="Dropped short",
+                        source_language="cs",
+                        target_language="en",
+                        audio=FakeUpload("source.wav", audio.getvalue()),  # type: ignore[arg-type]
+                        source_srt=FakeUpload("source.srt", b"1\n00:00:00,000 --> 00:00:00,100\nAhoj\n"),  # type: ignore[arg-type]
+                        target_srt=FakeUpload("target.srt", b"1\n00:00:00,000 --> 00:00:00,100\nHello\n"),  # type: ignore[arg-type]
+                        dialogue_script=FakeUpload("dialogue.txt", b"PUL: Ahoj\n"),  # type: ignore[arg-type]
+                        video=FakeUpload("picture.mp4", b"not decoded in import"),  # type: ignore[arg-type]
+                    )
+                )
+            finally:
+                local_ui.PROJECTS_ROOT = previous_root
+            config = json.loads(record.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["input"]["video"], "inputs/picture.mp4")
+            self.assertTrue((record.config_path.parent / config["input"]["audio"]).is_file())
+            self.assertTrue((record.config_path.parent / config["input"]["video"]).is_file())
+
+    def test_waveform_decimates_pcm_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "tone.wav"
+            samples = np.linspace(-0.5, 0.5, 1000, dtype=np.float32)
+            sf.write(path, samples, 1000)
+            waveform = generate_waveform(path, 128)
+            self.assertEqual(waveform["duration"], 1.0)
+            self.assertGreaterEqual(waveform["bins"], 64)
+            self.assertEqual(len(waveform["min"]), len(waveform["max"]))
+            self.assertLess(min(waveform["min"]), -0.45)
+            self.assertGreater(max(waveform["max"]), 0.45)
+
+    def test_candidate_assets_and_natural_pause_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            render_dir = project / "work" / "renders" / "001_PUL"
+            render_dir.mkdir(parents=True)
+            candidate_path = render_dir / "candidate_01.wav"
+            sf.write(candidate_path, np.zeros(800, dtype=np.float32), 8000)
+            manifest_path = project / "work" / "turn_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest[0]["render"] = {
+                "candidates": [{"variant": 1, "path": "work/renders/001_PUL/candidate_01.wav", "duration": 0.1}],
+                "selection": None,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+            self.assertEqual(candidate_summaries(record, 1)["candidates"][0]["variant"], 1)
+            self.assertEqual(candidate_audio(record, 1, "candidate-1"), candidate_path)
+            summary = update_pause_overrides(record, 1, [PauseMarker(after_word=1, duration_ms=350)])
+            rendered, markers = render_text_with_natural_pauses(project / "work", 1, "Hello there")
+            self.assertEqual(rendered, "Hello... there")
+            self.assertEqual(markers[0]["duration_ms"], 350)
+            self.assertEqual(summary["requested_pause_seconds"], 0.35)
+
     def test_project_status_and_translation_edit_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

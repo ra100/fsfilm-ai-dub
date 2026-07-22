@@ -5,6 +5,7 @@ faster-whisper
 fastapi
 librosa
 numpy
+python-multipart
 soundfile
 transformers
 uvicorn

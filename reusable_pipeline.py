@@ -371,16 +371,29 @@ def map_target_to_source(source: list[Cue], target: list[Cue]) -> dict[int, list
     return mapped
 
 
-def default_config(project: Path, name: str, audio: Path, source: Path, target: Path, script: Path, source_code: str, target_code: str) -> dict[str, Any]:
+def default_config(
+    project: Path,
+    name: str,
+    audio: Path,
+    source: Path,
+    target: Path,
+    script: Path,
+    source_code: str,
+    target_code: str,
+    video: Path | None = None,
+) -> dict[str, Any]:
+    input_config = {
+        "audio": rel_to_project(project, audio),
+        "source_srt": rel_to_project(project, source),
+        "target_srt": rel_to_project(project, target),
+        "dialogue_script": rel_to_project(project, script),
+    }
+    if video is not None:
+        input_config["video"] = rel_to_project(project, video)
     return {
         "schema_version": 1,
         "project": name,
-        "input": {
-            "audio": rel_to_project(project, audio),
-            "source_srt": rel_to_project(project, source),
-            "target_srt": rel_to_project(project, target),
-            "dialogue_script": rel_to_project(project, script),
-        },
+        "input": input_config,
         "languages": {
             "source": {"code": source_code, "name": LANGUAGE_NAMES.get(source_code.casefold(), source_code)},
             "target": {"code": target_code, "name": LANGUAGE_NAMES.get(target_code.casefold(), target_code), "asr_language": target_code},
@@ -423,6 +436,9 @@ def init(args: argparse.Namespace) -> None:
     if config_file.exists() and not args.force:
         die(f"{config_file} already exists (use --force to replace only the config)")
     inputs = [Path(args.audio).resolve(), Path(args.source_srt).resolve(), Path(args.target_srt).resolve(), Path(args.dialogue_script).resolve()]
+    video = Path(args.video).resolve() if args.video else None
+    if video is not None:
+        inputs.append(video)
     missing = [str(path) for path in inputs if not path.exists()]
     if missing:
         die("missing input(s): " + ", ".join(missing))
@@ -430,7 +446,8 @@ def init(args: argparse.Namespace) -> None:
     for folder in ("work", "output", "notes"):
         (project / folder).mkdir(exist_ok=True)
     config = default_config(
-        project, args.name or project.name, inputs[0], inputs[1], inputs[2], inputs[3], args.source_language, args.target_language
+        project, args.name or project.name, inputs[0], inputs[1], inputs[2], inputs[3],
+        args.source_language, args.target_language, video=video,
     )
     save(config_file, config)
     (project / "notes" / "README.txt").write_text(
@@ -1032,6 +1049,36 @@ def verify_gpu() -> None:
     print("GPU:", probe.stdout.strip(), flush=True)
 
 
+def render_text_with_natural_pauses(work: Path, group_number: int, text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Apply reviewed natural pause intent without contaminating delivery subtitles."""
+    path = work / "pause_overrides.json"
+    overrides = load(path) if path.exists() else {}
+    if not isinstance(overrides, dict):
+        die(f"pause overrides must be a JSON object: {path}")
+    markers = overrides.get(str(group_number), [])
+    if not isinstance(markers, list):
+        die(f"pause overrides for group {group_number} must be a list")
+    words = text.split()
+    natural: list[dict[str, Any]] = []
+    for marker in markers:
+        if not isinstance(marker, dict):
+            die(f"pause override for group {group_number} must be an object")
+        mode = marker.get("mode", "natural")
+        after_word = marker.get("after_word")
+        duration = marker.get("duration_ms")
+        if mode == "hard":
+            die(f"group {group_number} requests a hard pause; hard pause insertion is not implemented yet")
+        if mode != "natural" or not isinstance(after_word, int) or not isinstance(duration, int):
+            die(f"invalid natural pause override for group {group_number}")
+        if not 1 <= after_word <= len(words) or not 50 <= duration <= 5000:
+            die(f"natural pause override is outside the text/duration range for group {group_number}")
+        natural.append({"after_word": after_word, "duration_ms": duration, "mode": "natural"})
+    for marker in sorted(natural, key=lambda item: item["after_word"], reverse=True):
+        index = marker["after_word"] - 1
+        words[index] = words[index].rstrip(".,;:!?") + "..."
+    return " ".join(words), natural
+
+
 def render(args: argparse.Namespace) -> None:
     """Render one fresh, source-conditioned take per complete speaker turn."""
     _, project, config = read_config(args.config)
@@ -1062,6 +1109,7 @@ def render(args: argparse.Namespace) -> None:
         if requested is not None and int(group["group"]) not in requested:
             continue
         role = group["role"]
+        render_text, pause_markers = render_text_with_natural_pauses(work, int(group["group"]), group["lip_sync_text"])
         if role not in references:
             die(f"missing actor reference for role {role}; run make-references")
         group_dir = work / "renders" / f"{int(group['group']):03d}_{role}"
@@ -1098,7 +1146,7 @@ def render(args: argparse.Namespace) -> None:
                 random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
                 print(f"A-lipsync {int(group['group']):03d} {role} variant {variant}/{variants}", flush=True)
                 tts.infer(
-                    spk_audio_prompt=str(speaker), text=group["lip_sync_text"], output_path=str(output),
+                    spk_audio_prompt=str(speaker), text=render_text, output_path=str(output),
                     emo_audio_prompt=str(emotion), emo_alpha=float(render_cfg.get("emotion_alpha", 0.90)),
                     do_sample=True, temperature=float(render_cfg.get("temperature", 0.80)), top_p=0.8, top_k=30,
                     num_beams=3, interval_silence=80, verbose=False,
@@ -1108,6 +1156,8 @@ def render(args: argparse.Namespace) -> None:
             "method": "A_lipsync",
             "emotion": rel_to_project(project, emotion),
             "emotion_method": emotion_method,
+            "render_text": render_text,
+            "pause_markers": pause_markers,
             "candidates": candidates,
             "selection": None,
         }
@@ -1336,6 +1386,7 @@ def main() -> None:
     p = sub.add_parser("init", help="create a new project config")
     p.add_argument("--project", required=True)
     p.add_argument("--audio", required=True)
+    p.add_argument("--video", help="optional picture reference for local review")
     p.add_argument("--source-srt", required=True)
     p.add_argument("--target-srt", required=True)
     p.add_argument("--dialogue-script", required=True)

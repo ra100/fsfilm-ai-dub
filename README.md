@@ -30,6 +30,15 @@ register a project outside this repository. Build the bundled React interface
 with `cd ai_dub/web && pnpm install && pnpm build`; the FastAPI server will
 then serve it from the same loopback address.
 
+Use **Import dropped files** to create a project from dialogue audio, source
+and target SRTs, a role-labelled script, and optional picture video. The local
+browser copies these files to the new ignored project `inputs/` directory and
+writes their portable relative paths, including `input.video`, to
+`pipeline.json`. Existing projects can accept a picture video by dropping it
+onto the preview area. The review workspace includes cached source waveform
+peaks and stable colour-coded character lanes; clicking a lane seeks and loops
+the corresponding dialogue turn.
+
 This repository deliberately contains only portable code and documentation.
 Models, Python environments, vendor checkouts, media, subtitle assets, actor
 references, work directories, output WAVs, project configurations, and
