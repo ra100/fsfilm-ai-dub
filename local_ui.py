@@ -21,13 +21,16 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 PIPELINE_PATH = REPO_ROOT / "reusable_pipeline.py"
 DEFAULT_STATE_DIR = REPO_ROOT / ".local-ui"
+WEB_DIST_DIR = REPO_ROOT / "web" / "dist"
 TERMINAL_JOB_STATES = {"completed", "failed", "cancelled"}
 ALLOWED_COMMANDS = {
     "preflight",
@@ -598,6 +601,17 @@ def create_app(
         docs_url="/api/docs",
         redoc_url=None,
     )
+    # Vite's development server is local too; production assets are served by
+    # this same process after ``npm run build``.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT"],
+        allow_headers=["content-type"],
+    )
+    if (WEB_DIST_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=WEB_DIST_DIR / "assets"), name="ui-assets")
     app.state.projects = projects
     app.state.jobs = jobs
 
@@ -607,11 +621,15 @@ def create_app(
         except KeyError as error:
             raise HTTPException(status_code=404, detail="Unknown or unavailable project") from error
 
-    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    async def index() -> str:
+    @app.get("/", include_in_schema=False)
+    async def index():
+        built_index = WEB_DIST_DIR / "index.html"
+        if built_index.is_file():
+            return FileResponse(built_index)
         return """<!doctype html><html><head><meta charset='utf-8'><title>FSFilm AI Dub</title></head>
 <body><main><h1>FSFilm AI Dub local UI</h1><p>The backend is running locally.</p>
-<p>Use <a href='/api/docs'>the API documentation</a> while the React review interface is built.</p></main></body></html>"""
+<p>Build the React review interface with <code>cd web &amp;&amp; pnpm install &amp;&amp; pnpm build</code>,
+or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>"""
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:

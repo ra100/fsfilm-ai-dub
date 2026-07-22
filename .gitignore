@@ -18,6 +18,18 @@
 !skills/*/agents/openai.yaml
 !tests/
 !tests/*.py
+!web/
+!web/package.json
+!web/pnpm-lock.yaml
+!web/tsconfig.json
+!web/tsconfig.app.json
+!web/tsconfig.node.json
+!web/vite.config.ts
+!web/index.html
+!web/src/
+!web/src/*.ts
+!web/src/*.tsx
+!web/src/*.css
 
 # Local runtime/model/vendor data are deliberately never versioned.
 .venv/

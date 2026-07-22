@@ -26,8 +26,9 @@ ai_dub/.venv/bin/python ai_dub/run_local_ui.py
 Open `http://127.0.0.1:7860` for the local service and
 `http://127.0.0.1:7860/api/docs` for its temporary API interface. Use
 `--project /path/to/project` and, where needed, `--allow-root /path/to` to
-register a project outside this repository. The React/video review UI is the
-next implementation phase.
+register a project outside this repository. Build the bundled React interface
+with `cd ai_dub/web && pnpm install && pnpm build`; the FastAPI server will
+then serve it from the same loopback address.
 
 This repository deliberately contains only portable code and documentation.
 Models, Python environments, vendor checkouts, media, subtitle assets, actor

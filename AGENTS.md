@@ -75,3 +75,5 @@ Repository-local skills describe the two recurring workflows:
 - Store requested pauses separately from clean subtitle text. Natural pauses
   are the default; hard inserted pauses and phrase splits require visible QA
   because they may alter timing or introduce seams.
+- Use `pnpm` for the React/Vite frontend. Commit its `pnpm-lock.yaml`; do not
+  introduce an npm lockfile.
