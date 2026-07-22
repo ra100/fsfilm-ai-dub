@@ -2,7 +2,9 @@
 # IndexTTS2 itself is installed separately under third_party/index-tts; see
 # REUSABLE_PIPELINE.md.
 faster-whisper
+fastapi
 librosa
 numpy
 soundfile
 transformers
+uvicorn

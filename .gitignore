@@ -7,6 +7,8 @@
 !REUSABLE_PIPELINE.md
 !requirements.txt
 !reusable_pipeline.py
+!local_ui.py
+!run_local_ui.py
 !docs/
 !docs/*.md
 !skills/
@@ -14,6 +16,8 @@
 !skills/*/SKILL.md
 !skills/*/agents/
 !skills/*/agents/openai.yaml
+!tests/
+!tests/*.py
 
 # Local runtime/model/vendor data are deliberately never versioned.
 .venv/

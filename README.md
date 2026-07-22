@@ -13,6 +13,22 @@ The planned local browser UI is documented in
 [docs/LOCAL_UI_PLAN.md](docs/LOCAL_UI_PLAN.md). It will drive this same
 pipeline without replacing its portable project artifacts or rendering logic.
 
+## Local UI backend (early implementation)
+
+The first local-only backend is available now. It discovers projects under
+`projects/`, exposes status/review APIs, and queues only whitelisted pipeline
+commands. It binds to loopback only by default:
+
+```bash
+ai_dub/.venv/bin/python ai_dub/run_local_ui.py
+```
+
+Open `http://127.0.0.1:7860` for the local service and
+`http://127.0.0.1:7860/api/docs` for its temporary API interface. Use
+`--project /path/to/project` and, where needed, `--allow-root /path/to` to
+register a project outside this repository. The React/video review UI is the
+next implementation phase.
+
 This repository deliberately contains only portable code and documentation.
 Models, Python environments, vendor checkouts, media, subtitle assets, actor
 references, work directories, output WAVs, project configurations, and
