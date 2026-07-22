@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Dub Project"
+  short_description: "Safely review and render dub projects"
+  default_prompt: "Use $ai-dub-project to review, update, or render a local dubbing project."

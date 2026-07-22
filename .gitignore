@@ -2,10 +2,18 @@
 # unignored below before they can be committed.
 *
 !.gitignore
+!AGENTS.md
 !README.md
 !REUSABLE_PIPELINE.md
 !requirements.txt
 !reusable_pipeline.py
+!docs/
+!docs/*.md
+!skills/
+!skills/*/
+!skills/*/SKILL.md
+!skills/*/agents/
+!skills/*/agents/openai.yaml
 
 # Local runtime/model/vendor data are deliberately never versioned.
 .venv/

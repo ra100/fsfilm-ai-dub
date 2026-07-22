@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Dub Local UI"
+  short_description: "Build the local dubbing review UI"
+  default_prompt: "Use $ai-dub-local-ui to build or improve the local dubbing review application."
