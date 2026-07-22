@@ -23,6 +23,7 @@ from local_ui import (
     load_csv,
     project_snapshot,
     project_paths,
+    role_summaries,
     update_group_role,
     update_pause_overrides,
     write_csv_atomic,
@@ -189,6 +190,16 @@ class LocalUiTests(unittest.TestCase):
             self.assertIsNone(updated_manifest[0]["render"]["selection"])
             self.assertEqual(load_csv(project / "work" / "translation_review.csv")[1][0]["role"], "TAL")
             self.assertEqual(json.loads((project / "work" / "candidate_overrides.json").read_text(encoding="utf-8")), {})
+
+    def test_role_picker_includes_unassigned_script_cast(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = make_project(root)
+            (project / "script.txt").write_text("PUL: Ahoj\nSHE: Neviditelna replika\n", encoding="utf-8")
+            store = ProjectStore(root / "state", [root])
+            record = store.register(project)
+
+            self.assertEqual([item["role"] for item in role_summaries(record)], ["PUL", "SHE"])
 
     def test_project_status_and_translation_edit_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

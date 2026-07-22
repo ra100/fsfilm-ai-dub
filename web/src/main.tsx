@@ -73,6 +73,7 @@ function App() {
   const activeProject = projects.find((project) => project.id === projectId) ?? null
   const activeGroup = groups.find((group) => group.group === selectedGroup) ?? null
   const roles = useMemo(() => [...new Set(groups.map((group) => group.role))].sort(), [groups])
+  const availableRoles = useMemo(() => [...new Set([...roles, ...rolesInfo.map((role) => role.role)])].sort(), [roles, rolesInfo])
   const pauseWords = useMemo(() => draft.match(/[\w']+/g) ?? [], [draft])
   const duration = waveform?.duration ?? 0
 
@@ -313,10 +314,9 @@ function App() {
         <section className="review-panel">{activeGroup ? <>
           <div className="turn-heading"><div><p className="eyebrow">TURN {String(activeGroup.group).padStart(2, '0')} · {activeGroup.role}</p><h2>{timestamp(activeGroup.source_start)}–{timestamp(activeGroup.source_end)}</h2></div><div className="turn-facts"><span>{activeGroup.target_word_budget} word budget</span><span>{activeGroup.candidate_count} candidates</span>{activeGroup.selection?.candidate && <span>selected C{activeGroup.selection.candidate}</span>}</div></div>
           <form className="role-editor" onSubmit={changeRole}>
-            <label>Character / actor<input list="known-roles" value={roleDraft} onChange={(event) => setRoleDraft(event.target.value)} placeholder="e.g. TAL" required /></label>
-            <datalist id="known-roles">{[...new Set([...roles, ...rolesInfo.map((role) => role.role)])].sort().map((role) => <option key={role} value={role} />)}</datalist>
+            <label>Character / actor<select value={roleDraft} onChange={(event) => setRoleDraft(event.target.value)}>{availableRoles.map((role) => <option key={role} value={role}>{role}</option>)}</select></label>
             <button className="secondary" type="submit" disabled={busy !== null || roleDraft.trim().toUpperCase() === activeGroup.role}>Correct character</button>
-            <span>Updates the matching script line and retires old takes for its affected turn(s).</span>
+            <span>Complete cast from the dialogue script. Updates matching lines and retires old takes for affected turn(s).</span>
           </form>
           <section className="picture-card" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void uploadVideo(file) }}>
             {activeProject?.has_video ? <video ref={videoRef} muted preload="metadata" src={`${apiBase}/api/projects/${projectId}/media/video`} /> : <div className="video-placeholder"><strong>Drop a picture reference here</strong><span>or <label className="inline-file">choose a video<input type="file" accept="video/*" onChange={(event) => event.target.files?.[0] && void uploadVideo(event.target.files[0])} /></label> to set <code>input.video</code>.</span></div>}

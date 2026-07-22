@@ -583,6 +583,32 @@ def validate_role(role: str) -> str:
     return value
 
 
+def script_role_names(record: ProjectRecord, config: dict[str, Any]) -> set[str]:
+    """Return cast labels declared anywhere in the project dialogue script.
+
+    The manifest only contains roles that the current subtitle alignment used.
+    The script is the complete cast source, including a character whose line
+    was skipped or has not been built yet.
+    """
+    input_config = config.get("input", {}) if isinstance(config.get("input"), dict) else {}
+    script_value = input_config.get("dialogue_script") if isinstance(input_config, dict) else None
+    if not isinstance(script_value, str):
+        return set()
+    script_path = resolve_path(project_paths(record)["project"], script_value)
+    if not script_path.is_file():
+        return set()
+    roles: set[str] = set()
+    for raw_line in script_path.read_text(encoding="utf-8-sig").splitlines():
+        match = re.fullmatch(r"\s*([^:]{1,32}):\s*.+", raw_line)
+        if not match:
+            continue
+        try:
+            roles.add(validate_role(match.group(1)))
+        except ValueError:
+            continue
+    return roles
+
+
 def update_group_role(record: ProjectRecord, group_number: int, role: str) -> dict[str, Any]:
     """Correct a script-backed cast assignment and retire stale voice takes.
 
@@ -721,8 +747,19 @@ def role_summaries(record: ProjectRecord) -> list[dict[str, Any]]:
     paths = project_paths(record)
     configured = config.get("roles", {}) if isinstance(config, dict) and isinstance(config.get("roles"), dict) else {}
     manifest = read_json(paths["work"] / "turn_manifest.json", [])
-    roles = set(configured)
-    roles.update(item.get("role") for item in manifest if isinstance(item, dict) and item.get("role"))
+    roles = script_role_names(record, config) if isinstance(config, dict) else set()
+    for value in configured:
+        try:
+            roles.add(validate_role(str(value)))
+        except ValueError:
+            continue
+    for item in manifest if isinstance(manifest, list) else []:
+        if not isinstance(item, dict) or not item.get("role"):
+            continue
+        try:
+            roles.add(validate_role(str(item["role"])))
+        except ValueError:
+            continue
     results = []
     for role in sorted(roles):
         entry = configured.get(role, {}) if isinstance(configured.get(role), dict) else {}
