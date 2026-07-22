@@ -28,7 +28,7 @@ For a new short, provide:
 
 - a mono or stereo dialogue/final-mix WAV;
 - optionally, a picture reference video for local UI lip-sync review;
-- source-language SRT (Czech in the normal use case);
+- source-language SRT;
 - a legacy target-language SRT. Its wording is a semantic starting point only;
 - a source-language dialogue script where every spoken line is `ROLE: text`.
 
@@ -231,7 +231,7 @@ the first actor's turn.
 ### 4. Render, select and review
 
 Render one complete, source-conditioned A-style turn at a time. It uses the
-actor reference for identity and the Czech/source turn for emotion and melody.
+actor reference for identity and the source-language turn for emotion and melody.
 
 ```bash
 $INDEXPY ai_dub/reusable_pipeline.py render --config "$PIPE" --variants 3

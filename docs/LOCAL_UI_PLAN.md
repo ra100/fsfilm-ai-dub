@@ -131,7 +131,7 @@ This is the primary lip-sync review surface:
 
 ```text
 Video preview: frame step | loop selected group | playback-speed control
-Audio: Czech source | selected English | candidate 1 / 2 / 3
+Audio: selected source language | selected target language | candidate 1 / 2 / 3
 Timeline: waveform | subtitle boundaries | speech range | pause markers
 Editor: translation | timing/pause controls | render/select actions
 ```
@@ -141,7 +141,7 @@ Required behaviour:
 - synchronised video/audio playback and sample/frame-aware seeking;
 - loop a selected group with configurable pre-roll and post-roll;
 - frame stepping and keyboard playback controls;
-- switch among Czech, selected English, and A/B/C candidates at the same
+- switch among the selected source language, selected target language, and A/B/C candidates at the same
   playhead; and
 - show source speech range, grouped turn duration, generated duration,
   original subtitle boundaries, and QA/timing warnings.
@@ -228,6 +228,6 @@ used for rendering/review and does not pollute the final SRT.
 
 An editor can open a local project, edit a group’s reviewed translation, see it
 against the picture, render three fresh takes on the local GPU, compare all
-three with the Czech source, choose one, and preserve that selection in the
+three with the source-language performance, choose one, and preserve that selection in the
 same portable project files used by the CLI. No output is uploaded, silently
 replaced, speed-adjusted, or assembled into a master without explicit action.

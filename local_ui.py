@@ -379,7 +379,7 @@ async def create_imported_project(
     if not name or len(name) > 160:
         raise ValueError("Project name must be 1–160 characters")
     if not re.fullmatch(r"[a-z]{2,8}", source_language) or not re.fullmatch(r"[a-z]{2,8}", target_language):
-        raise ValueError("Language codes must be 2–8 lowercase letters")
+        raise ValueError("Language codes must be 2–8 letters supported by the selected models")
     if not is_within(PROJECTS_ROOT, store.allowed_roots):
         raise PermissionError(f"Imported projects require an allowed root containing {PROJECTS_ROOT}")
     project = PROJECTS_ROOT / project_slug(name)
@@ -1221,8 +1221,8 @@ or use <a href='/api/docs'>the API documentation</a>.</p></main></body></html>""
     @app.post("/api/projects/import", status_code=201)
     async def import_project(
         project_name: str = Form(...),
-        source_language: str = Form("cs"),
-        target_language: str = Form("en"),
+        source_language: str = Form(...),
+        target_language: str = Form(...),
         audio: UploadFile = File(...),
         source_srt: UploadFile = File(...),
         target_srt: UploadFile = File(...),

@@ -28,7 +28,7 @@ from local_ui import (
     update_pause_overrides,
     write_csv_atomic,
 )
-from reusable_pipeline import render_text_with_natural_pauses
+from reusable_pipeline import clean_generation, default_config, render_text_with_natural_pauses, validate_translation_text
 
 
 class FakeUpload:
@@ -106,8 +106,8 @@ class LocalUiTests(unittest.TestCase):
                     create_imported_project(
                         store,
                         display_name="Dropped short",
-                        source_language="cs",
-                        target_language="en",
+                        source_language="de",
+                        target_language="ja",
                         audio=FakeUpload("source.wav", audio.getvalue()),  # type: ignore[arg-type]
                         source_srt=FakeUpload("source.srt", b"1\n00:00:00,000 --> 00:00:00,100\nAhoj\n"),  # type: ignore[arg-type]
                         target_srt=FakeUpload("target.srt", b"1\n00:00:00,000 --> 00:00:00,100\nHello\n"),  # type: ignore[arg-type]
@@ -119,8 +119,30 @@ class LocalUiTests(unittest.TestCase):
                 local_ui.PROJECTS_ROOT = previous_root
             config = json.loads(record.config_path.read_text(encoding="utf-8"))
             self.assertEqual(config["input"]["video"], "inputs/picture.mp4")
+            self.assertEqual(config["languages"]["source"]["code"], "de")
+            self.assertEqual(config["languages"]["target"]["code"], "ja")
             self.assertTrue((record.config_path.parent / config["input"]["audio"]).is_file())
             self.assertTrue((record.config_path.parent / config["input"]["video"]).is_file())
+
+    def test_pipeline_language_helpers_follow_the_selected_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            config = default_config(
+                project,
+                "any-pair",
+                project / "dialogue.wav",
+                project / "source.srt",
+                project / "target.srt",
+                project / "dialogue.txt",
+                "ar",
+                "ja",
+            )
+            self.assertEqual(config["languages"]["source"]["name"], "Arabic")
+            self.assertEqual(config["languages"]["target"]["name"], "Japanese")
+            self.assertEqual(config["translation"]["accent"], "Neutral Japanese accent")
+            self.assertEqual(clean_generation("Japanese: こんにちは", config), "こんにちは")
+            self.assertEqual(validate_translation_text("こんにちは", config), [])
+            self.assertIn("model label leaked", validate_translation_text("Japanese: こんにちは", config)[0])
 
     def test_waveform_decimates_pcm_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,7 +5,8 @@ import { CharacterTimeline, roleColor, type Waveform } from './timeline'
 import './styles.css'
 
 type Counts = { turns: number; approved_translations: number; rendered_turns: number; selected_turns: number }
-type Project = { id: string; name: string; config_path: string; has_video: boolean; stage: 'initialized' | 'ready'; counts: Counts; review_files: Record<string, boolean> }
+type Language = { code?: string; name?: string }
+type Project = { id: string; name: string; config_path: string; has_video: boolean; stage: 'initialized' | 'ready'; counts: Counts; review_files: Record<string, boolean>; languages?: { source?: Language; target?: Language } }
 type Group = {
   group: number; role: string; source_start: number; source_end: number; source_text: string; legacy_target_text: string
   lip_sync_text: string; target_word_budget: number; translation_state: string; timing_state: string; role_confidence: number
@@ -41,6 +42,13 @@ function timestamp(seconds: number): string {
   return `${minutes}:${remainder.toFixed(2).padStart(5, '0')}`
 }
 
+function languageLabel(language: Language | undefined, fallback: string): string {
+  const name = language?.name?.trim()
+  const code = language?.code?.trim()
+  if (name && code && name.toLowerCase() !== code.toLowerCase()) return `${name} (${code})`
+  return name || code || fallback
+}
+
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const sourceAudioRef = useRef<HTMLAudioElement>(null)
@@ -72,6 +80,8 @@ function App() {
 
   const activeProject = projects.find((project) => project.id === projectId) ?? null
   const activeGroup = groups.find((group) => group.group === selectedGroup) ?? null
+  const sourceLanguage = languageLabel(activeProject?.languages?.source, 'Source language')
+  const targetLanguage = languageLabel(activeProject?.languages?.target, 'Target language')
   const roles = useMemo(() => [...new Set(groups.map((group) => group.role))].sort(), [groups])
   const availableRoles = useMemo(() => [...new Set([...roles, ...rolesInfo.map((role) => role.role)])].sort(), [roles, rolesInfo])
   const pauseWords = useMemo(() => draft.match(/[\w']+/g) ?? [], [draft])
@@ -325,8 +335,8 @@ function App() {
           </section>
           {waveform && <CharacterTimeline waveform={waveform} groups={groups} selectedGroup={selectedGroup} playhead={playhead} zoom={timelineZoom} viewStart={timelineStart} onZoomChange={setTimelineZoom} onViewStartChange={setTimelineStart} onSeek={seek} onSelect={(group) => { const fullGroup = groups.find((item) => item.group === group.group); if (fullGroup) selectTurn(fullGroup) }} />}
           {candidates?.candidates.length ? <section className="candidate-panel"><div className="panel-title"><div><h3>Candidate audition</h3><span>All raw takes are retained; choose one manually or let the selector score them.</span></div><button className="secondary" disabled={busy !== null} onClick={() => queue('select', { groups: [activeGroup.group] })}>Apply manual choice</button></div><div className="candidate-grid">{candidates.candidates.map((candidate) => <article key={candidate.variant} className={`candidate-card ${candidate.selected ? 'candidate-selected' : ''}`}><div><b>Candidate {candidate.variant}</b>{candidate.selected && <span className="selected-badge">selected</span>}</div><audio controls preload="metadata" src={`${apiBase}/api/projects/${projectId}/groups/${activeGroup.group}/audio/candidate-${candidate.variant}`} /><dl><div><dt>Duration</dt><dd>{candidate.duration?.toFixed(2) ?? '—'} s</dd></div><div><dt>Recall</dt><dd>{candidate.word_recall ?? 'not scored'}</dd></div><div><dt>Overrun</dt><dd>{candidate.overrun?.toFixed(2) ?? '—'} s</dd></div></dl>{candidate.transcript && <p className="candidate-transcript">{candidate.transcript}</p>}<button className="secondary" disabled={busy !== null} onClick={() => void chooseCandidate(candidate.variant)}>{busy === `candidate-${candidate.variant}` ? 'Choosing…' : `Use candidate ${candidate.variant}`}</button></article>)}</div></section> : null}
-          <div className="text-compare"><article><h3>Czech source</h3><p>{activeGroup.source_text}</p></article><article><h3>Legacy English</h3><p>{activeGroup.legacy_target_text}</p></article></div>
-          <form className="translation-editor" onSubmit={saveTranslation}><label>Reviewed lip-sync English<textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={4} required /></label><div className="editor-footer"><label className="approval"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} /> Approved after bilingual/creative review</label><label className="notes">Notes<input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Pronunciation, intent, or review note" /></label><button type="submit" disabled={busy !== null}>{busy === 'save' ? 'Saving…' : 'Save review'}</button></div></form>
+          <div className="text-compare"><article><h3>{sourceLanguage} source</h3><p>{activeGroup.source_text}</p></article><article><h3>Legacy {targetLanguage} subtitle</h3><p>{activeGroup.legacy_target_text}</p></article></div>
+          <form className="translation-editor" onSubmit={saveTranslation}><label>Reviewed {targetLanguage} lip-sync dialogue<textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={4} required /></label><div className="editor-footer"><label className="approval"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} /> Approved after bilingual/creative review</label><label className="notes">Notes<input value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Pronunciation, intent, or review note" /></label><button type="submit" disabled={busy !== null}>{busy === 'save' ? 'Saving…' : 'Save review'}</button></div></form>
           <section className="pause-panel"><div className="panel-title"><div><h3>Natural pause plan</h3><span>Stored outside subtitle text; render the group again after saving.</span></div><button className="secondary" type="button" disabled={pauseWords.length === 0} onClick={() => setPauseMarkers((markers) => [...markers, { after_word: Math.min(Math.max(1, pauseWords.length), 2), duration_ms: 350, mode: 'natural' }])}>Add pause</button></div>{pauseMarkers.length ? <div className="pause-markers">{pauseMarkers.map((marker, index) => <div className="pause-marker" key={`${marker.after_word}-${index}`}><label>After<select value={marker.after_word} onChange={(event) => setPauseMarkers((markers) => markers.map((item, itemIndex) => itemIndex === index ? { ...item, after_word: Number(event.target.value) } : item))}>{pauseWords.map((word, wordIndex) => <option key={`${word}-${wordIndex}`} value={wordIndex + 1}>{wordIndex + 1}. {word}</option>)}</select></label><label>Pause ms<input type="number" min="50" max="5000" step="50" value={marker.duration_ms} onChange={(event) => setPauseMarkers((markers) => markers.map((item, itemIndex) => itemIndex === index ? { ...item, duration_ms: Number(event.target.value) } : item))} /></label><button className="secondary" type="button" onClick={() => setPauseMarkers((markers) => markers.filter((_, itemIndex) => itemIndex !== index))}>Remove</button></div>)}</div> : <p className="muted">No pause markers. Use punctuation in the translation for ordinary phrasing, or add a deliberate natural pause here.</p>}<div className="pause-footer"><button type="button" disabled={busy !== null} onClick={() => void savePauses()}>{busy === 'pauses' ? 'Saving…' : 'Save natural pauses'}</button>{pauseSummary && <span className={pauseSummary.remaining_seconds < 0 ? 'budget-negative' : 'budget-ok'}>Picture {pauseSummary.available_seconds}s · speech ≈ {pauseSummary.estimated_speech_seconds}s · pauses {pauseSummary.requested_pause_seconds}s · margin {pauseSummary.remaining_seconds}s</span>}</div><p className="muted">Exact hard silence insertion is deliberately not enabled yet: it needs word-aligned QA so it cannot shift later dialogue unnoticed.</p></section>
           <section className="actions" aria-label="Targeted pipeline actions"><button className="secondary" disabled={busy !== null} onClick={() => queue('apply-translations')}>Apply approved text</button><button disabled={busy !== null} onClick={() => queue('render', { groups: [activeGroup.group], variants: 3, force: true })}>Render 3 fresh takes</button><button className="secondary" disabled={busy !== null} onClick={() => queue('select', { groups: [activeGroup.group] })}>Select best take</button></section>
         </> : <p className="empty">Run build after import, then choose a dialogue turn.</p>}</section>

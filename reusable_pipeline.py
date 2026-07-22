@@ -47,10 +47,15 @@ ROLE_RE = re.compile(r"^([^:]{1,32}):\s*(.+)$")
 APPROVED = {"yes", "y", "true", "approved", "ok"}
 CJK_CODES = {"zh", "ja", "ko"}
 LANGUAGE_NAMES = {
-    "cs": "Czech", "sk": "Slovak", "pl": "Polish", "uk": "Ukrainian",
-    "de": "German", "fr": "French", "es": "Spanish", "it": "Italian",
-    "pt": "Portuguese", "en": "English", "ja": "Japanese", "ko": "Korean",
-    "zh": "Chinese",
+    "ar": "Arabic", "bg": "Bulgarian", "ca": "Catalan", "cs": "Czech",
+    "da": "Danish", "de": "German", "el": "Greek", "en": "English",
+    "es": "Spanish", "et": "Estonian", "fi": "Finnish", "fr": "French",
+    "he": "Hebrew", "hi": "Hindi", "hu": "Hungarian", "id": "Indonesian",
+    "it": "Italian", "ja": "Japanese", "ko": "Korean", "lt": "Lithuanian",
+    "lv": "Latvian", "nl": "Dutch", "no": "Norwegian", "pl": "Polish",
+    "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "sk": "Slovak",
+    "sr": "Serbian", "sv": "Swedish", "th": "Thai", "tr": "Turkish",
+    "uk": "Ukrainian", "vi": "Vietnamese", "yue": "Cantonese", "zh": "Chinese",
 }
 
 
@@ -190,7 +195,7 @@ def write_original_timing_srt(project: Path, config: dict[str, Any], groups: lis
         if not numbers:
             continue
         original = " ".join(by_number[number].text for number in numbers).strip()
-        revised = clean_generation(str(group.get("lip_sync_text", "")))
+        revised = clean_generation(str(group.get("lip_sync_text", "")), config)
         # Keeping the existing per-cue text prevents needless subtitle reflow
         # when the approved dialogue is already the target subtitle wording.
         if revised == original:
@@ -382,6 +387,10 @@ def default_config(
     target_code: str,
     video: Path | None = None,
 ) -> dict[str, Any]:
+    source_code = source_code.strip().casefold()
+    target_code = target_code.strip().casefold()
+    if not re.fullmatch(r"[a-z]{2,8}", source_code) or not re.fullmatch(r"[a-z]{2,8}", target_code):
+        die("source and target languages must use 2–8 letter model language codes")
     input_config = {
         "audio": rel_to_project(project, audio),
         "source_srt": rel_to_project(project, source),
@@ -407,7 +416,7 @@ def default_config(
         },
         "translation": {
             "words_per_second": 2.35,
-            "accent": "Neutral General American English",
+            "accent": f"Neutral {LANGUAGE_NAMES.get(target_code, target_code)} accent",
             "require_human_approval": True,
         },
         "render": {
@@ -733,7 +742,7 @@ def draft_lipsync(args: argparse.Namespace) -> None:
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        text = clean_generation(tokenizer.decode(generated[0][encoded.shape[1]:], skip_special_tokens=True))
+        text = clean_generation(tokenizer.decode(generated[0][encoded.shape[1]:], skip_special_tokens=True), config)
         row["candidate_lipsync_text"] = text
     with sheet_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
@@ -741,9 +750,17 @@ def draft_lipsync(args: argparse.Namespace) -> None:
     print(f"Wrote review-only drafts to {sheet_path}. Listen/read them, copy accepted text into lip_sync_text, then mark approved=yes.")
 
 
-def clean_generation(text: str) -> str:
+def clean_generation(text: str, config: dict[str, Any] | None = None) -> str:
     text = text.strip().strip('"“”')
-    text = re.sub(r"^(translation|english|line|target):\s*", "", text, flags=re.I)
+    labels = {"translation", "line", "target", "output"}
+    if config:
+        target = config.get("languages", {}).get("target", {}) if isinstance(config.get("languages"), dict) else {}
+        if isinstance(target, dict):
+            labels.update(str(target.get(key, "")).strip() for key in ("code", "name"))
+    labels.discard("")
+    label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    if label_pattern:
+        text = re.sub(rf"^(?:{label_pattern}):\s*", "", text, flags=re.I)
     return " ".join(text.replace("\n", " ").split())
 
 
@@ -784,11 +801,18 @@ def validate_translation_text(text: str, config: dict[str, Any]) -> list[str]:
     if not text.strip():
         return ["empty translation"]
     target = target_name(config)
-    # Curly apostrophes, typographic dashes and Latin names are normal English
-    # subtitle punctuation. Flag non-Latin scripts instead of rejecting them.
+    # Curly apostrophes, typographic dashes and Latin names are normal in a
+    # Latin-script English subtitle. Other target languages are never judged
+    # against this English-specific character heuristic.
     if target == "en" and re.search(r"[^\u0000-\u024F\u2010-\u202F]", text):
         issues.append("non-Latin characters in English text")
-    if re.search(r"(?:translation|english|output)\s*:", text, flags=re.I):
+    labels = {"translation", "line", "target", "output"}
+    target_config = config.get("languages", {}).get("target", {}) if isinstance(config.get("languages"), dict) else {}
+    if isinstance(target_config, dict):
+        labels.update(str(target_config.get(key, "")).strip() for key in ("code", "name"))
+    labels.discard("")
+    label_pattern = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    if label_pattern and re.search(rf"(?:{label_pattern})\s*:", text, flags=re.I):
         issues.append("model label leaked into dialogue")
     return issues
 
@@ -808,7 +832,7 @@ def apply_translations(args: argparse.Namespace) -> None:
         if row is None:
             issues.append({"group": group["group"], "issue": "missing row in translation sheet"})
             continue
-        text = clean_generation(row.get("lip_sync_text", ""))
+        text = clean_generation(row.get("lip_sync_text", ""), config)
         for issue in validate_translation_text(text, config):
             issues.append({"group": group["group"], "issue": issue})
         if require_approval and row.get("approved", "").strip().casefold() not in APPROVED:

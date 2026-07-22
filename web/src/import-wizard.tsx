@@ -3,14 +3,16 @@ import { DragEvent, FormEvent, useState } from 'react'
 type AssetKind = 'audio' | 'video' | 'source_srt' | 'target_srt' | 'dialogue_script'
 type Assets = Partial<Record<AssetKind, File>>
 
-const labels: Record<AssetKind, string> = {
-  audio: 'Dialogue audio',
-  video: 'Picture video (optional)',
-  source_srt: 'Czech/source SRT',
-  target_srt: 'English/target SRT',
-  dialogue_script: 'Role-labelled dialogue script',
-}
 const required: AssetKind[] = ['audio', 'source_srt', 'target_srt', 'dialogue_script']
+const commonLanguageCodes = ['ar', 'cs', 'de', 'en', 'es', 'fr', 'hi', 'it', 'ja', 'ko', 'nl', 'pl', 'pt', 'ru', 'tr', 'uk', 'vi', 'yue', 'zh']
+
+function assetLabel(kind: AssetKind, sourceLanguage: string, targetLanguage: string): string {
+  if (kind === 'audio') return 'Dialogue audio'
+  if (kind === 'video') return 'Picture video (optional)'
+  if (kind === 'source_srt') return sourceLanguage.trim() ? `Source SRT · ${sourceLanguage.trim().toUpperCase()}` : 'Source-language SRT'
+  if (kind === 'target_srt') return targetLanguage.trim() ? `Target SRT · ${targetLanguage.trim().toUpperCase()}` : 'Target-language SRT'
+  return 'Role-labelled source dialogue script'
+}
 
 function classify(file: File, assets: Assets): AssetKind | null {
   const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
@@ -29,8 +31,8 @@ type Props = {
 export function ImportWizard({ onImported, onClose }: Props) {
   const [assets, setAssets] = useState<Assets>({})
   const [name, setName] = useState('')
-  const [sourceLanguage, setSourceLanguage] = useState('cs')
-  const [targetLanguage, setTargetLanguage] = useState('en')
+  const [sourceLanguage, setSourceLanguage] = useState('')
+  const [targetLanguage, setTargetLanguage] = useState('')
   const [message, setMessage] = useState('Drop the five project assets here, then confirm their roles.')
   const [busy, setBusy] = useState(false)
 
@@ -87,16 +89,18 @@ export function ImportWizard({ onImported, onClose }: Props) {
         <span>The browser copies dropped files into this project’s ignored <code>inputs/</code> folder. Their original paths are never sent anywhere.</span>
         <label className="file-button">Choose files<input type="file" multiple onChange={(event) => event.target.files && addFiles(event.target.files)} /></label>
       </div>
-      <div className="asset-grid">{(Object.keys(labels) as AssetKind[]).map((kind) => <label className={`asset-slot ${assets[kind] ? 'ready' : ''}`} key={kind}>
-        <span>{labels[kind]}{required.includes(kind) ? ' *' : ''}</span>
+      <div className="asset-grid">{(['audio', 'video', 'source_srt', 'target_srt', 'dialogue_script'] as AssetKind[]).map((kind) => <label className={`asset-slot ${assets[kind] ? 'ready' : ''}`} key={kind}>
+        <span>{assetLabel(kind, sourceLanguage, targetLanguage)}{required.includes(kind) ? ' *' : ''}</span>
         <b>{assets[kind]?.name ?? 'Drop above or choose file'}</b>
         <input type="file" accept={kind === 'audio' ? 'audio/*' : kind === 'video' ? 'video/*' : kind.includes('srt') ? '.srt' : '.txt,.md'} onChange={(event) => event.target.files?.[0] && setAssets((current) => ({ ...current, [kind]: event.target.files![0] }))} />
       </label>)}</div>
       <div className="wizard-fields">
-        <label>Project name<input value={name} onChange={(event) => setName(event.target.value)} required placeholder="my_short_en" /></label>
-        <label>Source language<input value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value)} required /></label>
-        <label>Target language<input value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} required /></label>
+        <label>Project name<input value={name} onChange={(event) => setName(event.target.value)} required placeholder="my_short" /></label>
+        <label>Source language code<input list="language-codes" value={sourceLanguage} onChange={(event) => setSourceLanguage(event.target.value.toLowerCase())} required placeholder="e.g. cs" /></label>
+        <label>Target language code<input list="language-codes" value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value.toLowerCase())} required placeholder="e.g. en" /></label>
       </div>
+      <datalist id="language-codes">{commonLanguageCodes.map((code) => <option key={code} value={code} />)}</datalist>
+      <p className="muted">Use the 2–8 letter language code supported by your translation, TTS, and ASR models. The app accepts any supported source → target pair.</p>
       <p className="wizard-message">{message}</p>
       <button disabled={busy}>{busy ? 'Importing local files…' : 'Create project from dropped assets'}</button>
     </form>
